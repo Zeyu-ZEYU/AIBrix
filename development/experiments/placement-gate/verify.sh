@@ -17,12 +17,23 @@ CLAIMS=${CLAIMS:-"gate-a gate-b gate-c"}
 # The driver reserve the controller subtracts from a card's total.
 DRIVER_RESERVE_BYTES=268435456
 
+# The fourth column is the pod's GPU count, read from its resources exactly as
+# the controller reads it. A pod with none falls outside the memory gate; a pod
+# with one whose runtime reports no card is a fault, not a CPU-only pod.
 pods() {
   $KUBECTL get pods -n "$NAMESPACE" -l "$POOL_LABEL" -o json | python3 -c '
 import json, sys
 for pod in json.load(sys.stdin)["items"]:
     status = pod.get("status") or {}
-    print(pod["metadata"]["name"], status.get("podIP", "-"), status.get("phase", "-"))
+    gpus = 0
+    for container in (pod.get("spec") or {}).get("containers", []):
+        resources = container.get("resources") or {}
+        for section in ("limits", "requests"):
+            value = (resources.get(section) or {}).get("nvidia.com/gpu")
+            if value is not None:
+                gpus += int(value)
+                break
+    print(pod["metadata"]["name"], status.get("podIP", "-"), status.get("phase", "-"), gpus)
 '
 }
 
@@ -50,10 +61,14 @@ for claim in json.load(sys.stdin)["items"]:
 # spec.perGPU for what the card already owes. A disagreement between this and
 # the controller's own condition message is a real finding, not a script bug.
 ledger() {
-  local claims_json pod ip total snapshot
+  local claims_json pod ip gpus total snapshot
   claims_json=$($KUBECTL get modelclaims -n "$NAMESPACE" -o json)
-  while read -r pod ip _phase; do
+  while read -r pod ip _phase gpus; do
     [ -z "$pod" ] && continue
+    if [ "${gpus:-0}" = "0" ]; then
+      printf '%-42s no GPU allocated, the gate does not apply\n' "$pod"
+      continue
+    fi
     snapshot=$($KUBECTL get --raw "/api/v1/namespaces/$NAMESPACE/pods/$pod:8080/proxy/v1/runtime/snapshot" 2>/dev/null)
     if [ -z "$snapshot" ]; then
       printf '%-42s snapshot unavailable\n' "$pod"
@@ -88,7 +103,7 @@ for claim in json.load(sys.stdin)["items"]:
         size = (footprint + floor) / 2**30
         lines.append(f"{name}={size:.0f}GiB")
 if total == 0:
-    print(f"{pod:<42} no accelerator reported, the gate does not apply")
+    print(f"{pod:<42} has a GPU but the runtime reported no usable card: refused")
 elif blind:
     print(f"{pod:<42} unreadable: {blind} declares no perGPU")
 else:

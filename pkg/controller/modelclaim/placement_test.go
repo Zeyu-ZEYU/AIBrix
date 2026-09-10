@@ -397,12 +397,12 @@ func TestPlacementEventReason(t *testing.T) {
 }
 
 func TestSelectPodForPlacementSkipsTheGateForPodsWithNoGPU(t *testing.T) {
-	// A CPU-only or mock runtime reports no accelerator. GPU memory accounting
-	// has nothing to say there, so the pod is usable exactly as it was before
-	// the ledger existed. Silence from a sidecar is the opposite case and must
-	// still refuse.
+	// A pod Kubernetes gave no GPU has no GPU memory to account for, so the
+	// gate has nothing to say and the pod is usable exactly as it was before
+	// the ledger existed. A pod that does hold a card is the opposite case,
+	// whatever its runtime managed to report.
 	ordered := []*corev1.Pod{ptrPod("cpu-only")}
-	ledgers := map[string]podLedger{"cpu-only": {NoAccelerator: true}}
+	ledgers := map[string]podLedger{"cpu-only": {NoGPU: true}}
 
 	pod, refusals := selectPodForPlacement(ordered, ledgers, 600*gibibyte)
 	require.NotNil(t, pod)
@@ -414,7 +414,7 @@ func TestSelectPodForPlacementStillRefusesASilentSidecar(t *testing.T) {
 	ordered := []*corev1.Pod{ptrPod("silent"), ptrPod("cpu-only")}
 	ledgers := map[string]podLedger{
 		"silent":   {Missing: missingSnapshot},
-		"cpu-only": {NoAccelerator: true},
+		"cpu-only": {NoGPU: true},
 	}
 
 	pod, refusals := selectPodForPlacement(ordered, ledgers, 6*gibibyte)

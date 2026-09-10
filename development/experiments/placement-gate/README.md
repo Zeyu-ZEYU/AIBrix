@@ -160,6 +160,15 @@ kubectl delete -f development/experiments/placement-gate/claims.yaml
 kubectl scale deploy/warm-runtime-pool-zeyu -n zeyu-dev --replicas=1
 ```
 
+## A note on pods without GPUs
+
+Whether the gate applies to a pod is decided by the pod's ``nvidia.com/gpu``
+resources, not by what its runtime reports. A pool pod that requests a card and
+whose sidecar then reports no accelerator is treated as a fault and refused,
+because NVML missing or a device not mounted looks identical to a CPU-only pod
+from the snapshot, and that card may already be full. `verify.sh` prints each
+pod's GPU count so the two cases can be told apart at a glance.
+
 ## What this does not cover
 
 Only the first gate exists. `minimumRoomBytes` and `currentRoomBytes`, the

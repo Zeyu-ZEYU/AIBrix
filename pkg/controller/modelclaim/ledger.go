@@ -68,9 +68,10 @@ const (
 	// all is known about this pod's cards. Silence is not evidence that a card
 	// is empty, which is why it refuses rather than admits.
 	missingSnapshot
-	// missingCardSize means the sidecar answered and does have accelerators,
-	// but not the number this model's parallelism spans, so there is no
-	// meaningful card size to charge the model against.
+	// missingCardSize means the pod was allocated GPUs but the runtime did not
+	// report a usable size for them: it saw no accelerator at all, or not as
+	// many as this model's parallelism spans. Either way the card exists and
+	// its state is unknown, which is the case this gate must not admit.
 	missingCardSize
 	// missingClaimNumbers means an instance already on this card belongs to a
 	// ModelClaim that never declared spec.perGPU, so its share of the card
@@ -83,7 +84,7 @@ func (m ledgerMissing) String() string {
 	case missingSnapshot:
 		return "runtime snapshot unavailable"
 	case missingCardSize:
-		return "the pod's accelerators do not match the model's parallelism"
+		return "the runtime reported no usable size for this pod's GPUs"
 	case missingClaimNumbers:
 		return "an instance on this pod has no declared spec.perGPU"
 	default:
@@ -112,19 +113,23 @@ type podLedger struct {
 	// incomplete, so an operator is told which ModelClaim to fix rather than
 	// only that one exists. Set only with missingClaimNumbers.
 	UndeclaredClaim types.NamespacedName
-	// NoAccelerator records that the runtime answered and reported no GPU at
-	// all. There is then no GPU memory to keep an account of, and a gate about
-	// GPU memory has nothing to say about this pod. It is the CPU-only and
-	// mock-engine case, and it is not the same as a runtime that stayed
-	// silent.
-	NoAccelerator bool
+	// NoGPU records that Kubernetes allocated this pod no GPU at all, read
+	// from the pod's nvidia.com/gpu resources rather than from anything the
+	// runtime said about itself. There is then no GPU memory to keep an
+	// account of, and a gate about GPU memory has nothing to say about the
+	// pod. This is the mock and CPU-only pool that podSupportsVLLMParallelism
+	// already admits. It is deliberately not inferred from an empty
+	// accelerator list: a pod that does hold a card reports the same empty
+	// list when NVML is missing or the device was not mounted, and admitting
+	// that pod would place a model on a card in an unknown state.
+	NoGPU bool
 }
 
 // accountable reports whether this pod has a card the ledger can keep an
 // account of. A pod with no GPU, or one whose size could not be established,
 // has nothing to charge an instance against.
 func (l podLedger) accountable() bool {
-	return !l.NoAccelerator && l.HBMUsableBytes > 0
+	return !l.NoGPU && l.HBMUsableBytes > 0
 }
 
 // MaximumRoomBytes is the most memory this card could ever offer a new
@@ -208,10 +213,10 @@ func (r *ModelClaimReconciler) collectPodLedgers(
 		pod := &candidates[i]
 		state, found := states[pod.Name]
 		switch {
+		case podGPUCount(*pod) == 0:
+			ledgers[pod.Name] = podLedger{NoGPU: true}
 		case !found:
 			ledgers[pod.Name] = podLedger{Missing: missingSnapshot}
-		case state.NoAccelerator:
-			ledgers[pod.Name] = podLedger{NoAccelerator: true}
 		case !state.HBMUsableKnown:
 			ledgers[pod.Name] = podLedger{Missing: missingCardSize}
 		default:

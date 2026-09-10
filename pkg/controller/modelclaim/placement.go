@@ -203,12 +203,13 @@ func selectPodForPlacement(
 		if !tracked {
 			ledger = podLedger{Missing: missingSnapshot}
 		}
-		// A runtime that reports no accelerator has no GPU memory to account
-		// for, so a gate about GPU memory does not apply to it. CPU-only pods
-		// and mock engines behave exactly as they did before the ledger
-		// existed. A runtime that said nothing at all is a different matter and
-		// falls through to the refusal below.
-		if ledger.NoAccelerator {
+		// A pod Kubernetes gave no GPU has no GPU memory to account for, so a
+		// gate about GPU memory does not apply to it. CPU-only pools and mock
+		// engines behave exactly as they did before the ledger existed. A pod
+		// that does hold a card falls through, whatever its runtime managed to
+		// report, because a card whose state is unknown is not a card known to
+		// be free.
+		if ledger.NoGPU {
 			return pod, refusals
 		}
 		room, known := ledger.MaximumRoomBytes()

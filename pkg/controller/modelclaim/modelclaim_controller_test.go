@@ -203,10 +203,28 @@ func warmPod(name, poolName string, enabled bool, phase corev1.PodPhase) *corev1
 	if enabled {
 		labels[constants.ModelPoolLabelEnabled] = constants.ModelPoolLabelEnabledValue
 	}
-	return &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace, Labels: labels},
 		Status:     corev1.PodStatus{Phase: phase, PodIP: "10.0.0.1"},
 	}
+	// A warm GPU pool pod holds a card. Placement reads that from the pod's
+	// resources, so a pod without one falls outside the memory gate entirely
+	// and would quietly stop every test here from exercising it.
+	pod.Spec.Containers = []corev1.Container{{
+		Name: "aibrix-runtime",
+		Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+			nvidiaGPUResourceName: *resource.NewQuantity(1, resource.DecimalSI),
+		}},
+	}}
+	return pod
+}
+
+// cpuOnlyWarmPod is the mock and legacy pool: a warm pod Kubernetes gave no
+// GPU. GPU memory accounting does not apply to it.
+func cpuOnlyWarmPod(name, poolName string) *corev1.Pod {
+	pod := warmPod(name, poolName, true, corev1.PodRunning)
+	pod.Spec.Containers = nil
+	return pod
 }
 
 func warmPodWithGPUs(name, poolName string, gpuCount int64) *corev1.Pod {

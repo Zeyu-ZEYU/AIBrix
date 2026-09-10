@@ -295,10 +295,13 @@ runtime sidecar did not answer or because an instance already on it belongs to
 a claim that declared nothing, the reason is ``LedgerIncomplete`` instead and
 the message names the claim to fix.
 
-A Pod whose runtime reports no accelerator at all, such as a CPU-only node or a
-mock engine, has no GPU memory to account for, so this check does not apply to
-it and placement proceeds as it did before. That is not the same as a sidecar
-that failed to answer: silence is not evidence that a card is free.
+A Pod that Kubernetes gave no GPU, such as a CPU-only pool or a mock engine,
+has no GPU memory to account for, so this check does not apply to it and
+placement proceeds as it did before. That is read from the Pod's
+``nvidia.com/gpu`` resources, not from what its runtime says about itself: a Pod
+that does hold a card reports the same empty accelerator list when NVML is
+missing or the device was not mounted, and admitting it would place a model on
+a card in an unknown state.
 
 For example:
 
