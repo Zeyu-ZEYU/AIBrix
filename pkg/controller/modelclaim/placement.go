@@ -203,6 +203,14 @@ func selectPodForPlacement(
 		if !tracked {
 			ledger = podLedger{Missing: missingSnapshot}
 		}
+		// A runtime that reports no accelerator has no GPU memory to account
+		// for, so a gate about GPU memory does not apply to it. CPU-only pods
+		// and mock engines behave exactly as they did before the ledger
+		// existed. A runtime that said nothing at all is a different matter and
+		// falls through to the refusal below.
+		if ledger.NoAccelerator {
+			return pod, refusals
+		}
 		room, known := ledger.MaximumRoomBytes()
 		if !known {
 			refusals = append(refusals, podRefusal{

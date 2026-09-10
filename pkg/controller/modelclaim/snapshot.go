@@ -107,6 +107,10 @@ type PodPlacementState struct {
 	// "the snapshot did not say".
 	HBMUsableBytes int64
 	HBMUsableKnown bool
+	// NoAccelerator distinguishes a runtime that reported no GPU from one that
+	// could not be reached. The first is a pod that GPU memory accounting does
+	// not apply to; the second is a pod nothing is known about.
+	NoAccelerator bool
 }
 
 func placementStateFromSnapshot(snapshot *RuntimeSnapshot, artifactURL string, parallelism int64) PodPlacementState {
@@ -133,6 +137,7 @@ func placementStateFromSnapshot(snapshot *RuntimeSnapshot, artifactURL string, p
 			state.MemoryKnown = true
 		}
 	}
+	state.NoAccelerator = len(snapshot.Accelerators) == 0
 	state.HBMUsableBytes, state.HBMUsableKnown = hbmUsableBytes(snapshot, parallelism)
 	for _, model := range snapshot.Models {
 		state.KVUsedBytes += model.KVUsedBytes

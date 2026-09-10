@@ -279,6 +279,53 @@ func TestCollectPodLedgers(t *testing.T) {
 		assert.False(t, known)
 	})
 
+	t.Run("a pod that reports no GPU is outside the account", func(t *testing.T) {
+		r, runtime := newReconciler(t)
+		candidates := pods("warm-1")
+		// A CPU-only runtime, or a mock engine, answers with an empty
+		// accelerator list rather than an error.
+		runtime.snapshots = map[string]*RuntimeSnapshot{
+			candidates[0].Status.PodIP: {Accelerators: []RuntimeAcceleratorSnapshot{}},
+		}
+		states := r.collectPlacementStates(context.Background(), candidates, "artifact", 1)
+		ledgers := r.collectPodLedgers(context.Background(), testNamespace, candidates, states)
+
+		assert.True(t, ledgers["warm-1"].NoAccelerator)
+		assert.Equal(t, missingNothing, ledgers["warm-1"].Missing,
+			"having no GPU is not a gap in the account")
+		assert.False(t, ledgers["warm-1"].accountable())
+	})
+
+	t.Run("cards that do not match the model's parallelism have no usable size", func(t *testing.T) {
+		r, runtime := newReconciler(t)
+		candidates := pods("warm-1")
+		runtime.snapshots = map[string]*RuntimeSnapshot{
+			candidates[0].Status.PodIP: {Accelerators: []RuntimeAcceleratorSnapshot{
+				{ID: "GPU-0", HBMTotalBytes: testHBMTotalBytes},
+			}},
+		}
+		states := r.collectPlacementStates(context.Background(), candidates, "artifact", 4)
+		ledgers := r.collectPodLedgers(context.Background(), testNamespace, candidates, states)
+
+		assert.Equal(t, missingCardSize, ledgers["warm-1"].Missing)
+		assert.False(t, ledgers["warm-1"].NoAccelerator,
+			"the pod has cards, just not the ones this model needs")
+	})
+
+	t.Run("an instance on an unaccountable pod is not charged anywhere", func(t *testing.T) {
+		resident := ledgerClaim("resident", "warm-1", 20*gibibyte, 4*gibibyte)
+		r, runtime := newReconciler(t, resident)
+		candidates := pods("warm-1")
+		runtime.snapshots = map[string]*RuntimeSnapshot{
+			candidates[0].Status.PodIP: {Accelerators: []RuntimeAcceleratorSnapshot{}},
+		}
+		states := r.collectPlacementStates(context.Background(), candidates, "artifact", 1)
+		ledgers := r.collectPodLedgers(context.Background(), testNamespace, candidates, states)
+
+		assert.Empty(t, ledgers["warm-1"].Instances)
+		assert.True(t, ledgers["warm-1"].NoAccelerator)
+	})
+
 	t.Run("a pod whose sidecar did not answer is unreadable", func(t *testing.T) {
 		r, runtime := newReconciler(t)
 		candidates := pods("warm-1")

@@ -395,3 +395,45 @@ func TestPlacementEventReason(t *testing.T) {
 	assert.Equal(t, refusalLedgerIncomplete, placementEventReason(refusalLedgerIncomplete))
 	assert.Equal(t, reasonNumbersMissing, placementEventReason(reasonNumbersMissing))
 }
+
+func TestSelectPodForPlacementSkipsTheGateForPodsWithNoGPU(t *testing.T) {
+	// A CPU-only or mock runtime reports no accelerator. GPU memory accounting
+	// has nothing to say there, so the pod is usable exactly as it was before
+	// the ledger existed. Silence from a sidecar is the opposite case and must
+	// still refuse.
+	ordered := []*corev1.Pod{ptrPod("cpu-only")}
+	ledgers := map[string]podLedger{"cpu-only": {NoAccelerator: true}}
+
+	pod, refusals := selectPodForPlacement(ordered, ledgers, 600*gibibyte)
+	require.NotNil(t, pod)
+	assert.Equal(t, "cpu-only", pod.Name)
+	assert.Empty(t, refusals)
+}
+
+func TestSelectPodForPlacementStillRefusesASilentSidecar(t *testing.T) {
+	ordered := []*corev1.Pod{ptrPod("silent"), ptrPod("cpu-only")}
+	ledgers := map[string]podLedger{
+		"silent":   {Missing: missingSnapshot},
+		"cpu-only": {NoAccelerator: true},
+	}
+
+	pod, refusals := selectPodForPlacement(ordered, ledgers, 6*gibibyte)
+	require.NotNil(t, pod)
+	assert.Equal(t, "cpu-only", pod.Name)
+	require.Len(t, refusals, 1)
+	assert.Equal(t, "silent", refusals[0].Pod)
+	assert.Equal(t, missingSnapshot, refusals[0].Missing)
+}
+
+func TestLedgerMissingStringsAreDistinct(t *testing.T) {
+	// These strings reach an operator inside a condition message, so each has
+	// to say which of the three situations it is.
+	seen := map[string]bool{}
+	for _, missing := range []ledgerMissing{missingSnapshot, missingCardSize, missingClaimNumbers} {
+		text := missing.String()
+		require.NotEmpty(t, text)
+		require.False(t, seen[text], "duplicate text %q", text)
+		seen[text] = true
+	}
+	assert.Empty(t, missingNothing.String())
+}

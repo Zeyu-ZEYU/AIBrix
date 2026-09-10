@@ -64,9 +64,14 @@ const (
 	// missingNothing is the zero value on purpose: a ledger is complete until
 	// something is found to be absent.
 	missingNothing ledgerMissing = iota
-	// missingSnapshot means the runtime sidecar did not answer, so the size of
-	// the card is unknown.
+	// missingSnapshot means the runtime sidecar did not answer, so nothing at
+	// all is known about this pod's cards. Silence is not evidence that a card
+	// is empty, which is why it refuses rather than admits.
 	missingSnapshot
+	// missingCardSize means the sidecar answered and does have accelerators,
+	// but not the number this model's parallelism spans, so there is no
+	// meaningful card size to charge the model against.
+	missingCardSize
 	// missingClaimNumbers means an instance already on this card belongs to a
 	// ModelClaim that never declared spec.perGPU, so its share of the card
 	// cannot be counted.
@@ -77,6 +82,8 @@ func (m ledgerMissing) String() string {
 	switch m {
 	case missingSnapshot:
 		return "runtime snapshot unavailable"
+	case missingCardSize:
+		return "the pod's accelerators do not match the model's parallelism"
 	case missingClaimNumbers:
 		return "an instance on this pod has no declared spec.perGPU"
 	default:
@@ -105,6 +112,19 @@ type podLedger struct {
 	// incomplete, so an operator is told which ModelClaim to fix rather than
 	// only that one exists. Set only with missingClaimNumbers.
 	UndeclaredClaim types.NamespacedName
+	// NoAccelerator records that the runtime answered and reported no GPU at
+	// all. There is then no GPU memory to keep an account of, and a gate about
+	// GPU memory has nothing to say about this pod. It is the CPU-only and
+	// mock-engine case, and it is not the same as a runtime that stayed
+	// silent.
+	NoAccelerator bool
+}
+
+// accountable reports whether this pod has a card the ledger can keep an
+// account of. A pod with no GPU, or one whose size could not be established,
+// has nothing to charge an instance against.
+func (l podLedger) accountable() bool {
+	return !l.NoAccelerator && l.HBMUsableBytes > 0
 }
 
 // MaximumRoomBytes is the most memory this card could ever offer a new
@@ -187,11 +207,16 @@ func (r *ModelClaimReconciler) collectPodLedgers(
 	for i := range candidates {
 		pod := &candidates[i]
 		state, found := states[pod.Name]
-		if !found || !state.HBMUsableKnown {
+		switch {
+		case !found:
 			ledgers[pod.Name] = podLedger{Missing: missingSnapshot}
-			continue
+		case state.NoAccelerator:
+			ledgers[pod.Name] = podLedger{NoAccelerator: true}
+		case !state.HBMUsableKnown:
+			ledgers[pod.Name] = podLedger{Missing: missingCardSize}
+		default:
+			ledgers[pod.Name] = podLedger{HBMUsableBytes: state.HBMUsableBytes}
 		}
-		ledgers[pod.Name] = podLedger{HBMUsableBytes: state.HBMUsableBytes}
 	}
 
 	list := &modelv1alpha1.ModelClaimList{}
@@ -212,7 +237,7 @@ func (r *ModelClaimReconciler) collectPodLedgers(
 		key := types.NamespacedName{Namespace: claim.Namespace, Name: claim.Name}
 		for _, instance := range claim.Status.Instances {
 			ledger, tracked := ledgers[instance.Pod]
-			if !tracked {
+			if !tracked || !ledger.accountable() {
 				continue
 			}
 			if !declared {

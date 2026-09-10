@@ -140,15 +140,18 @@ func (f *fakeRuntime) Snapshot(_ context.Context, podIP string, _ int) (*Runtime
 		return nil, nil
 	}
 	result := &RuntimeSnapshot{}
-	if snapshot, ok := f.snapshots[podIP]; ok {
+	snapshot, stated := f.snapshots[podIP]
+	if stated {
 		copy := *snapshot
 		copy.Models = append([]RuntimeSnapshotModel(nil), snapshot.Models...)
 		result = &copy
 	}
-	// A warm GPU pod always has a card. Without one the ledger cannot size it
-	// and placement refuses the pod, which would make every test about
-	// something else fail for an unrelated reason.
-	if len(result.Accelerators) == 0 {
+	// A warm GPU pod has a card unless a test says otherwise. Without one the
+	// ledger treats the pod as having no GPU at all and the memory gate steps
+	// aside, which would quietly stop every other test from exercising it. A
+	// test that states its own snapshot gets exactly what it stated, empty
+	// accelerator list included.
+	if !stated {
 		result.Accelerators = []RuntimeAcceleratorSnapshot{{
 			ID:            testAcceleratorName,
 			HBMTotalBytes: testHBMTotalBytes,

@@ -295,6 +295,11 @@ runtime sidecar did not answer or because an instance already on it belongs to
 a claim that declared nothing, the reason is ``LedgerIncomplete`` instead and
 the message names the claim to fix.
 
+A Pod whose runtime reports no accelerator at all, such as a CPU-only node or a
+mock engine, has no GPU memory to account for, so this check does not apply to
+it and placement proceeds as it did before. That is not the same as a sidecar
+that failed to answer: silence is not evidence that a card is free.
+
 For example:
 
 .. code-block:: yaml
