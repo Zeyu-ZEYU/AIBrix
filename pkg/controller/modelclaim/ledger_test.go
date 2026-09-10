@@ -97,13 +97,14 @@ func TestMaximumRoomBytes(t *testing.T) {
 	}{
 		{
 			name:      "an empty card offers all of itself",
-			ledger:    podLedger{HBMUsableBytes: 80 * gibibyte},
+			ledger:    podLedger{State: ledgerComplete, HBMUsableBytes: 80 * gibibyte},
 			want:      80 * gibibyte,
 			wantKnown: true,
 		},
 		{
 			name: "each instance costs its footprint plus its floor",
 			ledger: podLedger{
+				State:          ledgerComplete,
 				HBMUsableBytes: 80 * gibibyte,
 				Instances:      []ledgerInstance{line("a", 20*gibibyte, 4*gibibyte)},
 			},
@@ -113,6 +114,7 @@ func TestMaximumRoomBytes(t *testing.T) {
 		{
 			name: "instances accumulate",
 			ledger: podLedger{
+				State:          ledgerComplete,
 				HBMUsableBytes: 80 * gibibyte,
 				Instances: []ledgerInstance{
 					line("a", 20*gibibyte, 4*gibibyte),
@@ -123,8 +125,19 @@ func TestMaximumRoomBytes(t *testing.T) {
 			wantKnown: true,
 		},
 		{
+			name: "a card promised exactly all of itself has zero room, and knows it",
+			ledger: podLedger{
+				State:          ledgerComplete,
+				HBMUsableBytes: 24 * gibibyte,
+				Instances:      []ledgerInstance{line("a", 20*gibibyte, 4*gibibyte)},
+			},
+			want:      0,
+			wantKnown: true,
+		},
+		{
 			name: "an overcommitted card reports negative room rather than zero",
 			ledger: podLedger{
+				State:          ledgerComplete,
 				HBMUsableBytes: 10 * gibibyte,
 				Instances:      []ledgerInstance{line("a", 20*gibibyte, 4*gibibyte)},
 			},
@@ -137,21 +150,21 @@ func TestMaximumRoomBytes(t *testing.T) {
 		},
 		{
 			name:   "a pod with no GPU has no answer either",
-			ledger: podLedger{NoGPU: true},
+			ledger: podLedger{State: ledgerNoGPU},
 		},
 		{
 			name:   "no snapshot means no answer",
-			ledger: podLedger{Missing: missingSnapshot},
+			ledger: podLedger{State: ledgerUnread},
 		},
 		{
 			name:   "no usable card size means no answer",
-			ledger: podLedger{Missing: missingCardSize},
+			ledger: podLedger{State: ledgerNoCardSize},
 		},
 		{
 			name: "an undeclared neighbour means no answer even with a known card",
 			ledger: podLedger{
+				State:          ledgerUndeclared,
 				HBMUsableBytes: 80 * gibibyte,
-				Missing:        missingClaimNumbers,
 			},
 		},
 	}
@@ -336,7 +349,7 @@ func TestCollectPodLedgers(t *testing.T) {
 		r, runtime := newReconciler(t, legacy)
 		ledgers := collectLedgers(t, r, gpuPods(runtime, "warm-1"))
 
-		assert.Equal(t, missingNothing, ledgers["warm-1"].Missing)
+		assert.Equal(t, ledgerComplete, ledgers["warm-1"].State)
 		room, known := ledgers["warm-1"].MaximumRoomBytes()
 		require.True(t, known)
 		assert.Equal(t, testUsableBytes, room)
@@ -370,7 +383,7 @@ func TestCollectPodLedgers(t *testing.T) {
 		r, runtime := newReconciler(t, silent)
 		ledgers := collectLedgers(t, r, gpuPods(runtime, "warm-1"))
 
-		assert.Equal(t, missingClaimNumbers, ledgers["warm-1"].Missing)
+		assert.Equal(t, ledgerUndeclared, ledgers["warm-1"].State)
 		assert.Equal(t, "silent", ledgers["warm-1"].UndeclaredClaim.Name)
 		_, known := ledgers["warm-1"].MaximumRoomBytes()
 		assert.False(t, known)
@@ -382,7 +395,7 @@ func TestCollectPodLedgers(t *testing.T) {
 		runtime.nilSnapshots = map[string]bool{candidates[0].Status.PodIP: true}
 		ledgers := collectLedgers(t, r, candidates)
 
-		assert.Equal(t, missingSnapshot, ledgers["warm-1"].Missing)
+		assert.Equal(t, ledgerUnread, ledgers["warm-1"].State)
 		_, known := ledgers["warm-1"].MaximumRoomBytes()
 		assert.False(t, known)
 	})
@@ -399,8 +412,9 @@ func TestCollectPodLedgers(t *testing.T) {
 		}
 		ledgers := collectLedgers(t, r, candidates)
 
-		assert.False(t, ledgers["warm-1"].NoGPU)
-		assert.Equal(t, missingCardSize, ledgers["warm-1"].Missing)
+		assert.NotEqual(t, ledgerNoGPU, ledgers["warm-1"].State,
+			"a pod that holds a card is never mistaken for one without")
+		assert.Equal(t, ledgerNoCardSize, ledgers["warm-1"].State)
 	})
 
 	t.Run("a pod Kubernetes gave no GPU is outside the account", func(t *testing.T) {
@@ -408,10 +422,9 @@ func TestCollectPodLedgers(t *testing.T) {
 		candidates := []corev1.Pod{*cpuOnlyWarmPod("warm-1", "b300-pool-a")}
 		ledgers := collectLedgers(t, r, candidates)
 
-		assert.True(t, ledgers["warm-1"].NoGPU)
-		assert.Equal(t, missingNothing, ledgers["warm-1"].Missing,
-			"having no GPU is not a gap in the account")
-		assert.False(t, ledgers["warm-1"].accountable())
+		assert.Equal(t, ledgerNoGPU, ledgers["warm-1"].State,
+			"having no GPU is a state of its own, not a gap in the account")
+		assert.False(t, ledgers["warm-1"].chargeable())
 	})
 
 	t.Run("an instance on a pod with no GPU is not charged anywhere", func(t *testing.T) {
@@ -421,6 +434,6 @@ func TestCollectPodLedgers(t *testing.T) {
 		ledgers := collectLedgers(t, r, candidates)
 
 		assert.Empty(t, ledgers["warm-1"].Instances)
-		assert.True(t, ledgers["warm-1"].NoGPU)
+		assert.Equal(t, ledgerNoGPU, ledgers["warm-1"].State)
 	})
 }

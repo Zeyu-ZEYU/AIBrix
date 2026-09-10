@@ -55,38 +55,52 @@ import (
 // will eventually have to say its own figure.
 const defaultDriverReserveBytes int64 = 256 << 20
 
-// ledgerMissing says what a ledger could not find out. A ledger missing
-// anything cannot say how much room a card has, and a decision that would
-// claim a placement is impossible must not be made from an incomplete account.
-type ledgerMissing int
+// ledgerState says whether a ledger can answer how much room its card has,
+// and when it cannot, why. The five values are mutually exclusive, so a ledger
+// is in exactly one of them and no combination has to be reasoned about.
+//
+// Only ledgerComplete permits an answer. The rest are not the same as each
+// other: a pod with no GPU is one this account does not apply to, while the
+// others are pods it applies to but could not read.
+type ledgerState int
 
 const (
-	// missingNothing is the zero value on purpose: an account is complete
-	// until something is found to be absent.
-	missingNothing ledgerMissing = iota
-	// missingSnapshot means the runtime sidecar did not answer, so nothing at
-	// all is known about this pod's cards.
-	missingSnapshot
-	// missingCardSize means the pod was allocated GPUs but the runtime did not
-	// report a usable size for them: it saw no accelerator at all, or not as
-	// many as this model's parallelism spans.
-	missingCardSize
-	// missingClaimNumbers means an instance already on this card belongs to a
-	// ModelClaim that never declared spec.perGPU, so its share of the card
-	// cannot be counted.
-	missingClaimNumbers
+	// ledgerUnread is the zero value, and deliberately so. Looking up a pod
+	// that is not in the account yields this, and the honest thing for that
+	// lookup to say is that nothing is known about the pod. A state meaning
+	// "complete" here would let an untracked pod pass as an empty card.
+	ledgerUnread ledgerState = iota
+	// ledgerComplete means the card's size is known and every instance on it
+	// declared what it costs.
+	ledgerComplete
+	// ledgerNoGPU means Kubernetes allocated this pod no GPU, so there is no
+	// GPU memory to keep an account of. This is not a gap in the account; it
+	// is a pod the account does not cover.
+	ledgerNoGPU
+	// ledgerNoCardSize means the pod holds GPUs but the runtime reported no
+	// usable size for them: it saw no accelerator at all, or not as many as
+	// this model's parallelism spans.
+	ledgerNoCardSize
+	// ledgerUndeclared means an instance already on this card belongs to a
+	// ModelClaim that never declared spec.perGPU, so its share cannot be
+	// counted and the total is unknowable.
+	ledgerUndeclared
 )
 
-func (m ledgerMissing) String() string {
-	switch m {
-	case missingSnapshot:
-		return "runtime snapshot unavailable"
-	case missingCardSize:
+// String is the phrase an operator reads, so each value says what is wrong
+// rather than naming itself.
+func (s ledgerState) String() string {
+	switch s {
+	case ledgerComplete:
+		return "complete"
+	case ledgerNoGPU:
+		return "the pod holds no GPU"
+	case ledgerNoCardSize:
 		return "the runtime reported no usable size for this pod's GPUs"
-	case missingClaimNumbers:
+	case ledgerUndeclared:
 		return "an instance on this pod has no declared spec.perGPU"
 	default:
-		return ""
+		return "no readable account for this pod"
 	}
 }
 
@@ -107,28 +121,21 @@ type ledgerInstance struct {
 // every instance on such a pod occupies all of its cards, so the cards differ
 // only in size.
 type podLedger struct {
+	State          ledgerState
 	HBMUsableBytes int64
 	Instances      []ledgerInstance
-	Missing        ledgerMissing
-	// UndeclaredClaim names the claim that made this ledger incomplete, so an
+	// UndeclaredClaim names the claim that put the hole in this account, so an
 	// operator is told which ModelClaim to fix rather than only that one
-	// exists. Set only with missingClaimNumbers.
+	// exists. Set only with ledgerUndeclared. Go cannot attach a payload to an
+	// enum value, so this is the one field whose meaning depends on State.
 	UndeclaredClaim types.NamespacedName
-	// NoGPU records that Kubernetes allocated this pod no GPU at all, read
-	// from the pod's nvidia.com/gpu resources rather than from anything the
-	// runtime said about itself. There is then no GPU memory to keep an
-	// account of. It is deliberately not inferred from an empty accelerator
-	// list: a pod that does hold a card reports the same empty list when NVML
-	// is missing or the device was never mounted into the container, and
-	// treating that pod as GPU-free would hide a card in an unknown state.
-	NoGPU bool
 }
 
-// accountable reports whether this pod has a card the ledger can keep an
-// account of. A pod with no GPU, or one whose size could not be established,
-// has nothing to charge an instance against.
-func (l podLedger) accountable() bool {
-	return !l.NoGPU && l.HBMUsableBytes > 0
+// chargeable reports whether an instance can still be added to this pod's
+// account. Once a card cannot be sized, or its account already has a hole,
+// further entries change nothing: the total was already unknowable.
+func (l podLedger) chargeable() bool {
+	return l.State == ledgerComplete
 }
 
 // MaximumRoomBytes is the most memory this card could ever offer a new
@@ -138,12 +145,10 @@ func (l podLedger) accountable() bool {
 // be negative if the card is already promised more than it has.
 //
 // The second return is false when the ledger cannot answer, in which case the
-// first has no meaning. A card of no usable size is one of those cases and not
-// a full card: the zero value of this type is what a lookup for an untracked
-// pod produces, and it must mean "nothing is known" rather than "nothing is
-// left".
+// first has no meaning. Zero with a true second return is a real answer: a
+// card whose instances have been promised exactly all of it.
 func (l podLedger) MaximumRoomBytes() (int64, bool) {
-	if l.Missing != missingNothing || l.HBMUsableBytes <= 0 {
+	if l.State != ledgerComplete {
 		return 0, false
 	}
 	room := l.HBMUsableBytes
@@ -222,13 +227,16 @@ func (r *ModelClaimReconciler) collectPodLedgers(
 		state, found := states[pod.Name]
 		switch {
 		case podGPUCount(*pod) == 0:
-			ledgers[pod.Name] = podLedger{NoGPU: true}
+			ledgers[pod.Name] = podLedger{State: ledgerNoGPU}
 		case !found:
-			ledgers[pod.Name] = podLedger{Missing: missingSnapshot}
+			ledgers[pod.Name] = podLedger{State: ledgerUnread}
 		case !state.HBMUsableKnown:
-			ledgers[pod.Name] = podLedger{Missing: missingCardSize}
+			ledgers[pod.Name] = podLedger{State: ledgerNoCardSize}
 		default:
-			ledgers[pod.Name] = podLedger{HBMUsableBytes: state.HBMUsableBytes}
+			ledgers[pod.Name] = podLedger{
+				State:          ledgerComplete,
+				HBMUsableBytes: state.HBMUsableBytes,
+			}
 		}
 	}
 
@@ -238,7 +246,7 @@ func (r *ModelClaimReconciler) collectPodLedgers(
 		// already owes, which is the one direction that overcommits a GPU.
 		klog.ErrorS(err, "collect pod ledgers: list model claims", "namespace", namespace)
 		for name, ledger := range ledgers {
-			ledger.Missing = missingSnapshot
+			ledger.State = ledgerUnread
 			ledgers[name] = ledger
 		}
 		return ledgers
@@ -260,14 +268,12 @@ func (r *ModelClaimReconciler) collectPodLedgers(
 				continue
 			}
 			ledger, tracked := ledgers[instance.Pod]
-			if !tracked || !ledger.accountable() {
+			if !tracked || !ledger.chargeable() {
 				continue
 			}
 			if !declared {
-				if ledger.Missing == missingNothing {
-					ledger.Missing = missingClaimNumbers
-					ledger.UndeclaredClaim = key
-				}
+				ledger.State = ledgerUndeclared
+				ledger.UndeclaredClaim = key
 				ledgers[instance.Pod] = ledger
 				continue
 			}

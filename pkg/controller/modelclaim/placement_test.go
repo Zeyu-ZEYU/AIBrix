@@ -455,7 +455,7 @@ func TestRankCandidatesHeadMatchesTheSingleWinnerSearch(t *testing.T) {
 // roomLedger is a readable card with nothing on it, so a test states the room
 // it wants directly instead of building instances to consume it.
 func roomLedger(room int64) podLedger {
-	return podLedger{HBMUsableBytes: room}
+	return podLedger{State: ledgerComplete, HBMUsableBytes: room}
 }
 
 func TestFilterCandidatesRefusesACardThatCannotHoldTheModel(t *testing.T) {
@@ -502,22 +502,22 @@ func TestFilterCandidatesOnlyRefusesWhatItCanProve(t *testing.T) {
 		},
 		{
 			name:    "a pod Kubernetes gave no GPU is not judged on GPU memory",
-			ledger:  podLedger{NoGPU: true},
+			ledger:  podLedger{State: ledgerNoGPU},
 			reserve: 600 * gibibyte,
 		},
 		{
 			name:    "a silent sidecar is a different constraint, not this one",
-			ledger:  podLedger{Missing: missingSnapshot},
+			ledger:  podLedger{State: ledgerUnread},
 			reserve: 600 * gibibyte,
 		},
 		{
 			name:    "a card whose size could not be read is not proof of anything",
-			ledger:  podLedger{Missing: missingCardSize},
+			ledger:  podLedger{State: ledgerNoCardSize},
 			reserve: 600 * gibibyte,
 		},
 		{
 			name:    "a neighbour that declared nothing leaves the card unjudged",
-			ledger:  podLedger{HBMUsableBytes: 1 * gibibyte, Missing: missingClaimNumbers},
+			ledger:  podLedger{State: ledgerUndeclared, HBMUsableBytes: 1 * gibibyte},
 			reserve: 600 * gibibyte,
 		},
 		{
@@ -546,6 +546,7 @@ func TestFilterCandidatesReportsAnOvercommittedCard(t *testing.T) {
 	// information, not an error, and it must reach the operator intact.
 	candidates := []corev1.Pod{namedPod("oversold")}
 	ledgers := map[string]podLedger{"oversold": {
+		State:          ledgerComplete,
 		HBMUsableBytes: 10 * gibibyte,
 		Instances: []ledgerInstance{{
 			Claim:                 types.NamespacedName{Namespace: testNamespace, Name: "big"},
@@ -607,9 +608,36 @@ func TestProvablyTooFullExemptsAPodWithNoGPUBeforeSizingItsCard(t *testing.T) {
 	//
 	// Constructing a ledger the collector would never produce is the only way
 	// to hold the two apart while they still agree.
-	_, tooFull := provablyTooFull(podLedger{NoGPU: true, HBMUsableBytes: 1}, 600*gibibyte)
+	_, tooFull := provablyTooFull(podLedger{State: ledgerNoGPU, HBMUsableBytes: 1}, 600*gibibyte)
 	assert.False(t, tooFull, "a pod with no GPU is not judged on GPU memory")
 
-	_, tooFull = provablyTooFull(podLedger{HBMUsableBytes: 1}, 600*gibibyte)
+	_, tooFull = provablyTooFull(podLedger{State: ledgerComplete, HBMUsableBytes: 1}, 600*gibibyte)
 	assert.True(t, tooFull, "the same card without the exemption is provably too full")
+}
+
+func TestFilterCandidatesRefusesAFullCardButNotAnUnknownOne(t *testing.T) {
+	// Zero room and unknown room both arrive as the number zero. They must not
+	// be treated alike: a card promised exactly all of itself is provably too
+	// small for anything, while a card nobody could read proves nothing.
+	candidates := []corev1.Pod{namedPod("full"), namedPod("unread")}
+	ledgers := map[string]podLedger{
+		"full": {
+			State:          ledgerComplete,
+			HBMUsableBytes: 24 * gibibyte,
+			Instances: []ledgerInstance{{
+				Claim:                 types.NamespacedName{Namespace: testNamespace, Name: "a"},
+				MaximumFootprintBytes: 20 * gibibyte,
+				KVFloorBytes:          4 * gibibyte,
+			}},
+		},
+		"unread": {State: ledgerUnread},
+	}
+
+	feasible, refusals := filterCandidates(candidates, map[string]bool{}, ledgers, gibibyte)
+
+	require.Len(t, feasible, 1)
+	assert.Equal(t, "unread", feasible[0].Name)
+	require.Len(t, refusals, 1)
+	assert.Equal(t, "full", refusals[0].Pod)
+	assert.Equal(t, int64(0), refusals[0].MaximumRoomBytes)
 }

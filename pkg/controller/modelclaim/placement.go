@@ -159,7 +159,7 @@ func filterCandidates(
 // and a claim that declared no cost offers nothing to compare against. Each of
 // those admits the pod exactly as it was admitted before this check existed.
 func provablyTooFull(ledger podLedger, minimumReserveBytes int64) (int64, bool) {
-	if minimumReserveBytes <= 0 || ledger.NoGPU {
+	if minimumReserveBytes <= 0 || ledger.State == ledgerNoGPU {
 		return 0, false
 	}
 	room, known := ledger.MaximumRoomBytes()
