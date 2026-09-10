@@ -108,10 +108,15 @@ type ledgerInstance struct {
 
 // podLedger is the control plane's account of the GPU memory behind one warm
 // pod: how much of the card can hold an engine, and which instances have
-// already been promised part of it. A pod that spans several cards is
-// described by its tightest one, and that is exact rather than conservative:
-// every instance on such a pod occupies all of its cards, so the cards differ
-// only in size.
+// already been promised part of it. Every instance occupies all of the pod's
+// cards, so the pod is described by its tightest one and each instance is
+// charged its declared per-GPU cost against that card.
+//
+// Under tensor parallelism that is exact, since the ranks are identical. Under
+// pipeline parallelism it is conservative: the stages are not equal, a claim
+// declares its heaviest, and the lighter cards are charged more than they
+// hold. Telling those apart would mean keeping the account per accelerator
+// rather than per pod, which buys nothing in a homogeneous pool.
 type podLedger struct {
 	State ledgerState
 	// HBMUsableBytes is the card's size, and is hbmUsableUnknown unless State

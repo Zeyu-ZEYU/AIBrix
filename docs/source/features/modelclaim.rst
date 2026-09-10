@@ -281,9 +281,13 @@ needs. Each claim declares it:
      maximumFootprintBytes: 21474836480  # 20 GiB
      kvFloorBytes: 4294967296  # 4 GiB
 
-Both describe one device. With tensor or pipeline parallelism, declare what one
-rank costs on a single GPU rather than what the whole model costs, since a
-model's memory is spent per card.
+Both describe one device, and specifically the heaviest one. Tensor parallelism
+makes that question moot, because every rank holds the same slice of the model.
+Pipeline parallelism does not: vLLM gives the leftover layers to the earlier
+stages and puts the input and output embeddings at the two ends, so one stage
+costs more than the rest. Declare that stage. The lighter cards are then
+charged more than they hold, which wastes room and is safe, while an average
+would understate the card that decides whether the model fits.
 
 The footprint is the non-KV memory an engine holds: weights, captured CUDA
 graphs, activation workspaces and allocator retention. It cannot be derived
@@ -293,9 +297,24 @@ model with these engine arguments, under enough load to reach the engine's
 peak. Declaring more than the model needs wastes room and is safe; declaring
 less is not.
 
+With tensor or pipeline parallelism that run has several worker processes, one
+per GPU. **Take the largest of their readings, not their sum.** The sum is what
+the model costs in total, and the ledger is kept per card.
+
 The KV floor is the KV cache an instance needs to serve one request of
 ``max_model_len``. An engine's KV limit can be lowered towards that floor but
 never past it, so the memory is held for as long as the engine is awake.
+
+The same warning applies here, and it is easier to get wrong because the figure
+is arithmetic rather than a measurement. ``max_model_len`` times bytes per token
+is the KV for one request across *every* device. Tensor parallelism splits it by
+head and pipeline parallelism splits it by layer, so one device holds a fraction
+of it. Declaring the total overstates a card by roughly the parallelism degree.
+
+Every GPU a model uses is in the same Pod: ``podSupportsVLLMParallelism`` only
+admits a Pod whose GPU count equals the model's tensor times pipeline
+parallelism. A model needing more GPUs than one node has cannot be served
+through a ModelClaim.
 
 Both fields are required and are rejected by the API server unless positive, so
 a ModelClaim without them is never created. The control plane does not check

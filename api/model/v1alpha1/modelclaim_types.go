@@ -77,8 +77,15 @@ type ModelClaimSpec struct {
 // ModelClaimPerGPU is what a user declares about one instance's cost on a
 // single GPU. With tensor or pipeline parallelism the values describe one
 // device and not the whole model, since a model's memory is spent per card.
-// Declaring the whole model's cost instead overstates the need by the
-// parallelism degree, which wastes room but never overcommits a card.
+//
+// Which device: the heaviest one. Tensor parallelism makes the question moot,
+// because every rank holds the same slice of the model. Pipeline parallelism
+// does not. vLLM hands the leftover layers to the earlier stages and puts the
+// input and output embeddings at the two ends, so the stages are not equal and
+// one of them costs more than the rest. Declare that one. The lighter cards
+// are then charged more than they hold, which wastes room and is safe, while
+// an average would understate the card that decides whether the model fits.
+//
 // Both fields are required and must be positive. The API server is the only
 // place this is checked: the control plane reads them without testing whether
 // they are set, so a claim that reaches a controller always carries them.
@@ -88,8 +95,10 @@ type ModelClaimPerGPU struct {
 	// workspaces and allocator retention. It cannot be derived from the
 	// artifact size, because most of the gap between the two is allocator
 	// retention that does not scale with the weights, so it has to come from a
-	// run of this model with these engine arguments. Declaring more than the
-	// model needs wastes room and is safe; declaring less is not.
+	// run of this model with these engine arguments. With parallelism above 1
+	// that run has several worker processes: take the largest of their
+	// readings, not their sum. Declaring more than the model needs wastes room
+	// and is safe; declaring less is not.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Minimum=1
 	MaximumFootprintBytes int64 `json:"maximumFootprintBytes"`
@@ -99,6 +108,12 @@ type ModelClaimPerGPU struct {
 	// bytes per token, rounded up to the KV allocator's page granularity. An
 	// engine's KV limit can be lowered towards this floor but never past it,
 	// so the memory is held for as long as the engine is awake.
+	//
+	// Under parallelism this is the heaviest device's share of that request
+	// and not the whole request: tensor parallelism splits the KV by head,
+	// pipeline parallelism splits it by layer. A figure worked out as
+	// max_model_len times bytes per token is the total across every device,
+	// and overstates one device by roughly the parallelism degree.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Minimum=1
 	KVFloorBytes int64 `json:"kvFloorBytes"`
