@@ -46,15 +46,6 @@ import (
 // cannot be fixed by waiting. The other two arrive with the machinery that can
 // act on them.
 
-// defaultDriverReserveBytes is how much of a card never becomes usable memory:
-// the CUDA context and driver structures that exist before any engine starts.
-// Measured at 249 MiB on the 96 GB class card this was developed against, and
-// rounded up so the estimate errs towards leaving room rather than claiming
-// it. It is a property of the hardware and the driver, not of AIBrix, so it is
-// passed in rather than read from here directly; a pool on different cards
-// will eventually have to say its own figure.
-const defaultDriverReserveBytes int64 = 256 << 20
-
 // hbmUsableUnknown is what HBMUsableBytes holds whenever the ledger cannot say
 // how large the card is. It is negative rather than zero because zero is a
 // number arithmetic accepts: a reader who skipped the state check would
@@ -170,33 +161,28 @@ func claimMinimumReserveBytes(pm *modelv1alpha1.ModelClaim) int64 {
 	return pm.Spec.PerGPU.MaximumFootprintBytes + pm.Spec.PerGPU.KVFloorBytes
 }
 
-// hbmUsableBytes is how much of a pod's GPU memory can ever hold an engine.
-// It follows the same rule placementStateFromSnapshot uses for free memory: a
-// single-GPU engine wants the largest device, a fixed parallelism group spans
-// every device and is limited by the smallest.
+// hbmUsableBytes is how much of a pod's GPU memory can ever hold an engine,
+// taken from what the runtime measured rather than derived here. A pod with
+// several cards is described by its tightest one: which card an engine lands
+// on is decided by the device plugin, not by us, so the smallest is the only
+// safe reading. In a homogeneous pool every card is the same size and the
+// choice costs nothing.
 //
-// reserveBytes is what the driver keeps for itself on each card. It is a
-// property of the hardware, so the caller supplies it.
-func hbmUsableBytes(snapshot *RuntimeSnapshot, parallelism, reserveBytes int64) (int64, bool) {
+// One card the runtime could not size makes the whole pod unsizable. Taking
+// the cards it could read and ignoring the rest would describe a pod that does
+// not exist.
+func hbmUsableBytes(snapshot *RuntimeSnapshot) (int64, bool) {
 	if snapshot == nil || len(snapshot.Accelerators) == 0 {
-		return 0, false
-	}
-	if parallelism < 1 {
-		parallelism = 1
-	}
-	if parallelism > 1 && int64(len(snapshot.Accelerators)) != parallelism {
-		return 0, false
+		return hbmUsableUnknown, false
 	}
 	usable := int64(0)
 	known := false
 	for _, accelerator := range snapshot.Accelerators {
-		if accelerator.HBMTotalBytes <= reserveBytes {
-			continue
+		if accelerator.HBMUsableBytes <= 0 {
+			return hbmUsableUnknown, false
 		}
-		candidate := accelerator.HBMTotalBytes - reserveBytes
-		if !known || (parallelism == 1 && candidate > usable) ||
-			(parallelism > 1 && candidate < usable) {
-			usable, known = candidate, true
+		if !known || accelerator.HBMUsableBytes < usable {
+			usable, known = accelerator.HBMUsableBytes, true
 		}
 	}
 	return usable, known

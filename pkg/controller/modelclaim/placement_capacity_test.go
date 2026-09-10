@@ -149,9 +149,10 @@ func TestPlacementWalksPastItsFavouriteCard(t *testing.T) {
 	r, runtime := newReconciler(t, resident, arriving, warm1, warm2)
 	runtime.snapshots = map[string]*RuntimeSnapshot{
 		warm1.Status.PodIP: {
-			Accelerators: []RuntimeAcceleratorSnapshot{
-				{ID: "GPU-0", HBMTotalBytes: testHBMTotalBytes, HBMFreeBytes: testHBMTotalBytes},
-			},
+			Accelerators: []RuntimeAcceleratorSnapshot{{
+				ID: "GPU-0", HBMTotalBytes: testHBMTotalBytes,
+				HBMFreeBytes: testHBMTotalBytes, HBMUsableBytes: testUsableBytes,
+			}},
 			CachedArtifacts: []string{arriving.Spec.ArtifactURL},
 		},
 	}

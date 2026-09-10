@@ -133,7 +133,7 @@ func placementStateFromSnapshot(snapshot *RuntimeSnapshot, artifactURL string, p
 			state.MemoryKnown = true
 		}
 	}
-	state.HBMUsableBytes, state.HBMUsableKnown = hbmUsableBytes(snapshot, parallelism, defaultDriverReserveBytes)
+	state.HBMUsableBytes, state.HBMUsableKnown = hbmUsableBytes(snapshot)
 	for _, model := range snapshot.Models {
 		state.KVUsedBytes += model.KVUsedBytes
 	}

@@ -151,9 +151,10 @@ func (f *fakeRuntime) Snapshot(_ context.Context, podIP string, _ int) (*Runtime
 	// snapshot gets exactly what it stated, empty accelerator list included.
 	if !stated {
 		result.Accelerators = []RuntimeAcceleratorSnapshot{{
-			ID:            "GPU-test-0",
-			HBMTotalBytes: testHBMTotalBytes,
-			HBMFreeBytes:  testHBMTotalBytes,
+			ID:             "GPU-test-0",
+			HBMTotalBytes:  testHBMTotalBytes,
+			HBMFreeBytes:   testHBMTotalBytes,
+			HBMUsableBytes: testUsableBytes,
 		}}
 	}
 	for _, model := range f.models {
@@ -701,12 +702,19 @@ func TestReconcilePlacementPrefersRuntimeSnapshot(t *testing.T) {
 	hot.Status.PodIP = testPeerIP
 	r, runtime := newReconciler(t, pm, cold, hot)
 	runtime.snapshots = map[string]*RuntimeSnapshot{
+		// Both cards are large enough for the claim, so the ledger admits
+		// both and the ranking alone decides. The free-byte figures are only
+		// there to make the ranking's preference visible.
 		"10.0.0.1": {
-			Accelerators: []RuntimeAcceleratorSnapshot{{ID: "GPU-0", HBMFreeBytes: 900}},
-			Models:       []RuntimeSnapshotModel{{ModelName: "other", KVUsedBytes: 1}},
+			Accelerators: []RuntimeAcceleratorSnapshot{{
+				ID: "GPU-0", HBMFreeBytes: 900, HBMUsableBytes: testUsableBytes,
+			}},
+			Models: []RuntimeSnapshotModel{{ModelName: "other", KVUsedBytes: 1}},
 		},
 		testPeerIP: {
-			Accelerators:    []RuntimeAcceleratorSnapshot{{ID: "GPU-0", HBMFreeBytes: 100}},
+			Accelerators: []RuntimeAcceleratorSnapshot{{
+				ID: "GPU-0", HBMFreeBytes: 100, HBMUsableBytes: testUsableBytes,
+			}},
 			CachedArtifacts: []string{pm.Spec.ArtifactURL},
 		},
 	}

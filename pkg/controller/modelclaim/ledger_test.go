@@ -34,8 +34,9 @@ const (
 	testHBMTotalBytes int64 = 80 << 30
 )
 
-// testUsableBytes is what a test card offers once the driver has taken its cut.
-var testUsableBytes = testHBMTotalBytes - defaultDriverReserveBytes
+// testUsableBytes is what a test card reports as usable: the driver's cut is
+// measured by the runtime, so a test states the figure rather than deriving it.
+const testUsableBytes int64 = testHBMTotalBytes - (256 << 20)
 
 func TestClaimMinimumReserveBytes(t *testing.T) {
 	// spec.perGPU is required and both fields are validated positive, so this
@@ -154,73 +155,57 @@ func TestMaximumRoomBytes(t *testing.T) {
 }
 
 func TestHBMUsableBytes(t *testing.T) {
-	card := func(total int64) RuntimeAcceleratorSnapshot {
-		return RuntimeAcceleratorSnapshot{ID: "GPU", HBMTotalBytes: total}
+	card := func(usable int64) RuntimeAcceleratorSnapshot {
+		return RuntimeAcceleratorSnapshot{
+			ID:             "GPU",
+			HBMTotalBytes:  80 * gibibyte,
+			HBMUsableBytes: usable,
+		}
 	}
-	const reserve = defaultDriverReserveBytes
 	cases := []struct {
-		name        string
-		snapshot    *RuntimeSnapshot
-		parallelism int64
-		want        int64
-		wantKnown   bool
+		name      string
+		snapshot  *RuntimeSnapshot
+		want      int64
+		wantKnown bool
 	}{
-		{name: "nil snapshot"},
-		{name: "no accelerators", snapshot: &RuntimeSnapshot{}},
+		{name: "nil snapshot", want: hbmUsableUnknown},
+		{name: "no accelerators", snapshot: &RuntimeSnapshot{}, want: hbmUsableUnknown},
 		{
-			name:     "a card smaller than the driver reserve is not usable",
-			snapshot: &RuntimeSnapshot{Accelerators: []RuntimeAcceleratorSnapshot{card(1 << 20)}},
-		},
-		{
-			name:      "one card, minus the driver reserve",
-			snapshot:  &RuntimeSnapshot{Accelerators: []RuntimeAcceleratorSnapshot{card(80 * gibibyte)}},
-			want:      80*gibibyte - reserve,
+			name:      "one card, as the runtime measured it",
+			snapshot:  &RuntimeSnapshot{Accelerators: []RuntimeAcceleratorSnapshot{card(79 * gibibyte)}},
+			want:      79 * gibibyte,
 			wantKnown: true,
 		},
 		{
-			name: "a single-GPU engine takes the largest card",
+			name: "several cards are described by the tightest",
 			snapshot: &RuntimeSnapshot{Accelerators: []RuntimeAcceleratorSnapshot{
-				card(40 * gibibyte), card(80 * gibibyte),
+				card(79 * gibibyte), card(39 * gibibyte), card(59 * gibibyte),
 			}},
-			want:      80*gibibyte - reserve,
+			want:      39 * gibibyte,
 			wantKnown: true,
 		},
 		{
-			name: "a parallel engine is limited by the smallest card it spans",
+			name: "a card the runtime could not measure makes the pod unsizable",
 			snapshot: &RuntimeSnapshot{Accelerators: []RuntimeAcceleratorSnapshot{
-				card(40 * gibibyte), card(80 * gibibyte),
+				card(79 * gibibyte), card(hbmUsableUnknown),
 			}},
-			parallelism: 2,
-			want:        40*gibibyte - reserve,
-			wantKnown:   true,
+			want: hbmUsableUnknown,
 		},
 		{
-			name: "a parallel engine that does not match the visible cards is unknown",
+			name: "so does a runtime too old to report the figure at all",
 			snapshot: &RuntimeSnapshot{Accelerators: []RuntimeAcceleratorSnapshot{
-				card(40 * gibibyte), card(80 * gibibyte),
+				card(79 * gibibyte), card(0),
 			}},
-			parallelism: 4,
+			want: hbmUsableUnknown,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, known := hbmUsableBytes(tc.snapshot, tc.parallelism, reserve)
+			got, known := hbmUsableBytes(tc.snapshot)
 			assert.Equal(t, tc.wantKnown, known)
 			assert.Equal(t, tc.want, got)
 		})
 	}
-}
-
-func TestHBMUsableBytesTakesTheReserveFromItsCaller(t *testing.T) {
-	// The driver's cut belongs to the hardware, not to this package, so a pool
-	// on different cards can be given a different figure without touching the
-	// arithmetic.
-	snapshot := &RuntimeSnapshot{Accelerators: []RuntimeAcceleratorSnapshot{
-		{ID: "GPU", HBMTotalBytes: 80 * gibibyte},
-	}}
-	got, known := hbmUsableBytes(snapshot, 1, gibibyte)
-	require.True(t, known)
-	assert.Equal(t, 79*gibibyte, got)
 }
 
 // gpuPods returns warm pods that each hold one card, with distinct IPs and a
@@ -235,9 +220,12 @@ func gpuPods(runtime *fakeRuntime, names ...string) []corev1.Pod {
 		pod := warmPodWithGPUs(name, "b300-pool-a", 1)
 		pod.Status.PodIP = fmt.Sprintf("10.0.0.%d", i+1)
 		runtime.snapshots[pod.Status.PodIP] = &RuntimeSnapshot{
-			Accelerators: []RuntimeAcceleratorSnapshot{
-				{ID: "GPU-0", HBMTotalBytes: testHBMTotalBytes, HBMFreeBytes: testHBMTotalBytes},
-			},
+			Accelerators: []RuntimeAcceleratorSnapshot{{
+				ID:             "GPU-0",
+				HBMTotalBytes:  testHBMTotalBytes,
+				HBMFreeBytes:   testHBMTotalBytes,
+				HBMUsableBytes: testUsableBytes,
+			}},
 		}
 		pods = append(pods, *pod)
 	}

@@ -244,6 +244,17 @@ def cached_artifacts(cache_dir: Optional[str] = None) -> List[str]:
     return sorted(artifacts)
 
 
+# Usable memory per GPU UUID, measured once and kept for the life of the
+# process. Guarded by _nvml_lock, which already serializes every NVML read.
+_hbm_usable_bytes: Dict[str, int] = {}
+
+# HBM_USABLE_UNKNOWN is reported for a card whose usable memory could not be
+# measured. It is negative rather than zero because zero is a number the
+# control plane's arithmetic accepts, and a card of unknown size must not be
+# mistaken for a card with nothing left.
+HBM_USABLE_UNKNOWN = -1
+
+
 def _nvml_compute_processes(pynvml, handle):
     """Return NVML compute-process records across pynvml API versions."""
     for name in (
@@ -270,6 +281,11 @@ def gpu_memory_observation() -> tuple[
     The second return value is keyed by process ID and GPU UUID. It keeps the
     raw NVML attribution separate from ModelRuntime's process-tree ownership
     logic, which is necessary because vLLM uses worker child processes.
+
+    Each accelerator also carries hbm_usable_bytes, the memory an engine can
+    actually take on that card. It is measured once, on the first read that
+    finds the card with no compute process on it, and is HBM_USABLE_UNKNOWN
+    until then.
     """
     with _nvml_lock:
         initialized = False
@@ -287,14 +303,27 @@ def gpu_memory_observation() -> tuple[
                 if isinstance(device_id, bytes):
                     device_id = device_id.decode()
                 device_id = str(device_id)
+                processes = list(_nvml_compute_processes(pynvml, handle))
+                if device_id not in _hbm_usable_bytes and not processes:
+                    # Nothing holds this card, so everything free right now is
+                    # everything an engine will ever get: the remainder belongs
+                    # to the driver and is never returned. The runtime starts
+                    # before it launches any engine, so this is measured on the
+                    # first read and then kept, because later reads see the
+                    # engines' own allocations and cannot tell them apart from
+                    # the driver's.
+                    _hbm_usable_bytes[device_id] = int(info.free)
                 snapshots.append(
                     {
                         "id": device_id,
                         "hbm_total_bytes": int(info.total),
                         "hbm_free_bytes": int(info.free),
+                        "hbm_usable_bytes": _hbm_usable_bytes.get(
+                            device_id, HBM_USABLE_UNKNOWN
+                        ),
                     }
                 )
-                for process in _nvml_compute_processes(pynvml, handle):
+                for process in processes:
                     pid = getattr(process, "pid", None)
                     used = getattr(process, "usedGpuMemory", None)
                     if pid is None or used is None:

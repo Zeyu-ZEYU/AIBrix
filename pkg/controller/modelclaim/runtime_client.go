@@ -151,6 +151,13 @@ type RuntimeAcceleratorSnapshot struct {
 	ID            string `json:"id"`
 	HBMTotalBytes int64  `json:"hbm_total_bytes"`
 	HBMFreeBytes  int64  `json:"hbm_free_bytes"`
+	// HBMUsableBytes is how much of this card an engine can actually take: the
+	// total less whatever the driver keeps for itself. The runtime measures it
+	// once, while nothing held the card, because after an engine starts its
+	// allocations cannot be told apart from the driver's. It is negative when
+	// the runtime could not measure it, and zero from a runtime too old to
+	// report it at all; both mean the card cannot be sized.
+	HBMUsableBytes int64 `json:"hbm_usable_bytes"`
 }
 
 // RuntimeSnapshotModel is one engine reported by a runtime snapshot.

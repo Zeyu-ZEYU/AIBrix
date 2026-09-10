@@ -33,6 +33,20 @@ def make_agent():
     return ModelRuntime(MockEngineLauncher())
 
 
+@pytest.fixture(autouse=True)
+def _clear_hbm_usable_cache():
+    """Usable memory is measured once per process and kept.
+
+    That is right in production and wrong across tests, where each case has to
+    start without another one's measurement.
+    """
+    import aibrix.runtime.model_runtime as runtime_module
+
+    runtime_module._hbm_usable_bytes.clear()
+    yield
+    runtime_module._hbm_usable_bytes.clear()
+
+
 def test_gpu_memory_snapshots_serializes_nvml_lifecycle(monkeypatch):
     import aibrix.runtime.model_runtime as runtime_module
 
@@ -79,9 +93,21 @@ def test_gpu_memory_snapshots_serializes_nvml_lifecycle(monkeypatch):
     for thread in threads:
         thread.join()
 
+    # This fake reports no compute processes, so the first read measures the
+    # card and every later read repeats that figure.
     assert (
         snapshots
-        == [[{"id": "GPU-0", "hbm_total_bytes": 100, "hbm_free_bytes": 50}]] * 4
+        == [
+            [
+                {
+                    "id": "GPU-0",
+                    "hbm_total_bytes": 100,
+                    "hbm_free_bytes": 50,
+                    "hbm_usable_bytes": 50,
+                }
+            ]
+        ]
+        * 4
     )
     assert init_calls == 4
     assert shutdown_calls == 4
@@ -113,9 +139,21 @@ def test_gpu_memory_observation_reports_process_memory_by_gpu(monkeypatch):
 
     accelerators, process_hbm = runtime_module.gpu_memory_observation()
 
+    # Both cards already hold a compute process, so neither can be measured:
+    # what is free now includes nothing about what the driver keeps.
     assert accelerators == [
-        {"id": "GPU-0", "hbm_total_bytes": 1000, "hbm_free_bytes": 700},
-        {"id": "GPU-1", "hbm_total_bytes": 1000, "hbm_free_bytes": 600},
+        {
+            "id": "GPU-0",
+            "hbm_total_bytes": 1000,
+            "hbm_free_bytes": 700,
+            "hbm_usable_bytes": -1,
+        },
+        {
+            "id": "GPU-1",
+            "hbm_total_bytes": 1000,
+            "hbm_free_bytes": 600,
+            "hbm_usable_bytes": -1,
+        },
     ]
     assert process_hbm == {
         101: {"GPU-0": 111, "GPU-1": 222},
@@ -1175,3 +1213,76 @@ def test_engine_ready_connection_refused(monkeypatch):
 
     monkeypatch.setattr(httpx, "get", boom)
     assert engine_ready(29000) is False, "still-booting engine reads as not ready"
+
+
+def _nvml_with_processes(processes_for_handle):
+    """One-GPU NVML fake whose compute processes the caller controls."""
+    return SimpleNamespace(
+        nvmlInit=lambda: None,
+        nvmlShutdown=lambda: None,
+        nvmlDeviceGetCount=lambda: 1,
+        nvmlDeviceGetHandleByIndex=lambda index: index,
+        nvmlDeviceGetMemoryInfo=lambda handle: SimpleNamespace(
+            total=1000, free=_nvml_with_processes.free
+        ),
+        nvmlDeviceGetUUID=lambda handle: "GPU-0",
+        nvmlDeviceGetComputeRunningProcesses=processes_for_handle,
+    )
+
+
+def test_usable_memory_is_measured_once_on_an_idle_card(monkeypatch):
+    """The card is sized while nothing holds it, and that figure is kept.
+
+    Once an engine starts, free memory reflects the engine as well as the
+    driver, and the two cannot be told apart. So the measurement has to survive
+    the arrival of the engine unchanged.
+    """
+    import aibrix.runtime.model_runtime as runtime_module
+
+    _nvml_with_processes.free = 900
+    holders: list = []
+    monkeypatch.setitem(
+        sys.modules, "pynvml", _nvml_with_processes(lambda handle: holders)
+    )
+
+    first, _ = runtime_module.gpu_memory_observation()
+    assert first[0]["hbm_usable_bytes"] == 900
+
+    # An engine starts and takes 400 of the card.
+    _nvml_with_processes.free = 500
+    holders.append(SimpleNamespace(pid=101, usedGpuMemory=400))
+
+    second, _ = runtime_module.gpu_memory_observation()
+    assert second[0]["hbm_free_bytes"] == 500
+    assert second[0]["hbm_usable_bytes"] == 900, "the measurement must not drift"
+
+
+def test_usable_memory_stays_unknown_when_the_card_was_never_idle(monkeypatch):
+    """A card already in use at startup is never sized, and says so.
+
+    Reporting the total, or what happens to be free, would let the control
+    plane place a model against a number nobody measured.
+    """
+    import aibrix.runtime.model_runtime as runtime_module
+
+    _nvml_with_processes.free = 500
+    monkeypatch.setitem(
+        sys.modules,
+        "pynvml",
+        _nvml_with_processes(
+            lambda handle: [SimpleNamespace(pid=101, usedGpuMemory=400)]
+        ),
+    )
+
+    for _ in range(3):
+        accelerators, _ = runtime_module.gpu_memory_observation()
+        assert accelerators[0]["hbm_usable_bytes"] == -1
+
+
+def test_usable_memory_is_unknown_without_nvml(monkeypatch):
+    import aibrix.runtime.model_runtime as runtime_module
+
+    monkeypatch.setitem(sys.modules, "pynvml", None)
+    accelerators, process_hbm = runtime_module.gpu_memory_observation()
+    assert accelerators == []
+    assert process_hbm == {}
