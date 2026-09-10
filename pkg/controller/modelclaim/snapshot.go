@@ -100,6 +100,13 @@ type PodPlacementState struct {
 	HBMFreeBytes   int64
 	KVUsedBytes    int64
 	ModelCount     int
+	// HBMUsableBytes is how much of the pod's GPU memory can ever hold an
+	// engine: the card's total minus what the driver keeps for itself. Unlike
+	// HBMFreeBytes it does not move with traffic, so the ledger can be built
+	// on it. HBMUsableKnown separates "the card has no usable memory" from
+	// "the snapshot did not say".
+	HBMUsableBytes int64
+	HBMUsableKnown bool
 }
 
 func placementStateFromSnapshot(snapshot *RuntimeSnapshot, artifactURL string, parallelism int64) PodPlacementState {
@@ -126,6 +133,7 @@ func placementStateFromSnapshot(snapshot *RuntimeSnapshot, artifactURL string, p
 			state.MemoryKnown = true
 		}
 	}
+	state.HBMUsableBytes, state.HBMUsableKnown = hbmUsableBytes(snapshot, parallelism, defaultDriverReserveBytes)
 	for _, model := range snapshot.Models {
 		state.KVUsedBytes += model.KVUsedBytes
 	}
