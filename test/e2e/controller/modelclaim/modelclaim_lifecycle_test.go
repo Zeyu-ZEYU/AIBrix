@@ -243,6 +243,14 @@ func createLifecycleClaim(
 				}},
 				ArtifactURL: "huggingface://aibrix/" + model,
 				Engine:      "vllm",
+				// Placement checks a declared per-GPU cost against the card's
+				// ledger, so a claim without these numbers is never scheduled.
+				// The mock engine holds no real device memory; the figures are
+				// only here to make the claim admissible.
+				PerGPU: &modelv1alpha1.ModelClaimPerGPU{
+					MaximumFootprintBytes: ptr.To(int64(1 << 30)),
+					KVFloorBytes:          ptr.To(int64(1 << 30)),
+				},
 			},
 		},
 		metav1.CreateOptions{},

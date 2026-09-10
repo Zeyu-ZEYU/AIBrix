@@ -23,12 +23,18 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	modelv1alpha1 "github.com/vllm-project/aibrix/api/model/v1alpha1"
 )
 
 func namedPod(name string) corev1.Pod {
 	return corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name}}
+}
+
+func ptrPod(name string) *corev1.Pod {
+	pod := namedPod(name)
+	return &pod
 }
 
 func TestSelectPodForActivation_LeastLoaded(t *testing.T) {
@@ -216,4 +222,176 @@ func TestPruneDeadInstances(t *testing.T) {
 	// No candidates at all: every instance is stale.
 	pruneDeadInstances(pm, nil)
 	assert.Empty(t, pm.Status.Instances)
+}
+
+// roomLedger is a card with a known size and nothing on it, so a test states
+// the room it wants directly.
+func roomLedger(room int64) podLedger {
+	return podLedger{HBMUsableBytes: room}
+}
+
+func TestRankCandidatesHeadMatchesTheSingleWinnerSearch(t *testing.T) {
+	// Sorting has to reproduce the pod the old single-pass search returned, or
+	// turning the gate off would silently change placement.
+	cases := []struct {
+		name      string
+		pods      []corev1.Pod
+		load      map[string]int
+		alreadyOn map[string]bool
+		states    map[string]PodPlacementState
+	}{
+		{
+			name: "least loaded",
+			pods: []corev1.Pod{namedPod("a"), namedPod("b"), namedPod("c")},
+			load: map[string]int{"a": 2, "b": 0, "c": 1},
+		},
+		{
+			name:      "skips already on",
+			pods:      []corev1.Pod{namedPod("a"), namedPod("b")},
+			load:      map[string]int{"a": 0, "b": 5},
+			alreadyOn: map[string]bool{"a": true},
+		},
+		{
+			name: "name breaks a full tie",
+			pods: []corev1.Pod{namedPod("z"), namedPod("a")},
+			load: map[string]int{"z": 0, "a": 0},
+		},
+		{
+			name: "runtime state outranks load",
+			pods: []corev1.Pod{namedPod("cold"), namedPod("hot")},
+			load: map[string]int{"cold": 0, "hot": 9},
+			states: map[string]PodPlacementState{
+				"hot":  {SnapshotKnown: true, ArtifactCached: true},
+				"cold": {SnapshotKnown: true},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			alreadyOn := tc.alreadyOn
+			if alreadyOn == nil {
+				alreadyOn = map[string]bool{}
+			}
+			want, err := selectPodForActivationWithState(
+				tc.pods, alreadyOn, tc.load, "m", uniformLocality{}, tc.states)
+			require.NoError(t, err)
+			ordered := rankCandidates(tc.pods, alreadyOn, tc.load, "m", uniformLocality{}, tc.states)
+			require.NotEmpty(t, ordered)
+			assert.Equal(t, want.Name, ordered[0].Name)
+		})
+	}
+}
+
+func TestRankCandidatesOrdersEveryEligiblePod(t *testing.T) {
+	pods := []corev1.Pod{namedPod("c"), namedPod("a"), namedPod("b"), namedPod("taken")}
+	load := map[string]int{"a": 1, "b": 1, "c": 0, "taken": 0}
+	ordered := rankCandidates(pods, map[string]bool{"taken": true}, load, "m", uniformLocality{}, nil)
+
+	names := make([]string, 0, len(ordered))
+	for _, pod := range ordered {
+		names = append(names, pod.Name)
+	}
+	assert.Equal(t, []string{"c", "a", "b"}, names,
+		"least loaded first, then by name, and an occupied pod is not in the list")
+}
+
+func TestSelectPodForPlacementWalksPastTheFullestPod(t *testing.T) {
+	// The ranking puts artifact locality first, so its favourite pod is
+	// routinely the fullest. Walking down the list is the whole point.
+	ordered := []*corev1.Pod{ptrPod("hot"), ptrPod("warm"), ptrPod("empty")}
+	ledgers := map[string]podLedger{
+		"hot":   roomLedger(1 * gibibyte),
+		"warm":  roomLedger(3 * gibibyte),
+		"empty": roomLedger(40 * gibibyte),
+	}
+
+	pod, refusals := selectPodForPlacement(ordered, ledgers, 6*gibibyte)
+	require.NotNil(t, pod)
+	assert.Equal(t, "empty", pod.Name)
+	require.Len(t, refusals, 2)
+	assert.Equal(t, "hot", refusals[0].Pod)
+	assert.Equal(t, refusalInsufficientCapacity, refusals[0].Reason)
+	assert.Equal(t, 1*gibibyte, refusals[0].MaximumRoomBytes)
+	assert.Equal(t, "warm", refusals[1].Pod)
+}
+
+func TestSelectPodForPlacementTakesTheFirstPodThatFits(t *testing.T) {
+	ordered := []*corev1.Pod{ptrPod("first"), ptrPod("second")}
+	ledgers := map[string]podLedger{
+		"first":  roomLedger(40 * gibibyte),
+		"second": roomLedger(80 * gibibyte),
+	}
+
+	pod, refusals := selectPodForPlacement(ordered, ledgers, 6*gibibyte)
+	require.NotNil(t, pod)
+	assert.Equal(t, "first", pod.Name, "ranking decides among pods that fit, not size")
+	assert.Empty(t, refusals)
+}
+
+func TestSelectPodForPlacementExactFitIsAccepted(t *testing.T) {
+	ordered := []*corev1.Pod{ptrPod("exact")}
+	ledgers := map[string]podLedger{"exact": roomLedger(6 * gibibyte)}
+
+	pod, _ := selectPodForPlacement(ordered, ledgers, 6*gibibyte)
+	require.NotNil(t, pod)
+	assert.Equal(t, "exact", pod.Name)
+}
+
+func TestSelectPodForPlacementRefusesUnreadableLedgers(t *testing.T) {
+	ordered := []*corev1.Pod{ptrPod("blind"), ptrPod("undeclared"), ptrPod("untracked")}
+	ledgers := map[string]podLedger{
+		"blind": {Missing: missingSnapshot},
+		"undeclared": {
+			HBMUsableBytes:  80 * gibibyte,
+			Missing:         missingClaimNumbers,
+			UndeclaredClaim: types.NamespacedName{Namespace: testNamespace, Name: "silent"},
+		},
+	}
+
+	pod, refusals := selectPodForPlacement(ordered, ledgers, 6*gibibyte)
+	assert.Nil(t, pod)
+	require.Len(t, refusals, 3)
+	for _, refusal := range refusals {
+		assert.Equal(t, refusalLedgerIncomplete, refusal.Reason)
+	}
+	assert.Equal(t, missingClaimNumbers, refusals[1].Missing)
+	assert.Equal(t, "silent", refusals[1].UndeclaredClaim.Name)
+	assert.Equal(t, missingSnapshot, refusals[2].Missing,
+		"a pod with no ledger at all is treated as unmeasured, never as empty")
+}
+
+func TestSummarizeRefusals(t *testing.T) {
+	t.Run("no candidates at all", func(t *testing.T) {
+		reason, message := summarizeRefusals(nil, 6*gibibyte)
+		assert.Equal(t, "NoMatchingPods", reason)
+		assert.Contains(t, message, "selector")
+	})
+
+	t.Run("every card is genuinely full", func(t *testing.T) {
+		reason, message := summarizeRefusals([]podRefusal{
+			{Pod: "a", Reason: refusalInsufficientCapacity, MaximumRoomBytes: 1, RoomKnown: true},
+			{Pod: "b", Reason: refusalInsufficientCapacity, MaximumRoomBytes: 5, RoomKnown: true},
+		}, 6*gibibyte)
+		assert.Equal(t, refusalInsufficientCapacity, reason)
+		assert.Contains(t, message, "at most 5", "the roomiest pod is the useful one to report")
+	})
+
+	t.Run("an unreadable ledger outranks a full card", func(t *testing.T) {
+		reason, message := summarizeRefusals([]podRefusal{
+			{Pod: "a", Reason: refusalInsufficientCapacity, MaximumRoomBytes: 1, RoomKnown: true},
+			{
+				Pod: "b", Reason: refusalLedgerIncomplete, Missing: missingClaimNumbers,
+				UndeclaredClaim: types.NamespacedName{Namespace: testNamespace, Name: "silent"},
+			},
+		}, 6*gibibyte)
+		assert.Equal(t, refusalLedgerIncomplete, reason,
+			"a pod nobody could measure may well have had room")
+		assert.Contains(t, message, "silent", "the claim to fix has to be named")
+	})
+}
+
+func TestPlacementEventReason(t *testing.T) {
+	assert.Equal(t, "PlacementOutOfMemory", placementEventReason(refusalInsufficientCapacity))
+	assert.Equal(t, refusalLedgerIncomplete, placementEventReason(refusalLedgerIncomplete))
+	assert.Equal(t, reasonNumbersMissing, placementEventReason(reasonNumbersMissing))
 }

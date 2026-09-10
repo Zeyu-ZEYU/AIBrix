@@ -246,6 +246,54 @@ The supported spec fields are:
      - No
      - Engine CLI flags mapped to string values. Use an empty string for a
        boolean flag.
+   * - ``perGPU.maximumFootprintBytes``
+     - Yes
+     - The largest non-KV GPU memory one instance holds on a single device:
+       weights, captured CUDA graphs, activation workspaces and allocator
+       retention.
+   * - ``perGPU.kvFloorBytes``
+     - Yes
+     - The KV cache one instance needs on a single device to serve at all,
+       enough for one request of ``max_model_len``.
+
+Declare what the model costs
+----------------------------
+
+The control plane does not profile a model to find out how much GPU memory it
+needs. The claim declares it, and placement checks that declaration against
+what each card has already promised to the instances on it:
+
+.. code-block:: yaml
+
+   perGPU:
+     maximumFootprintBytes: 21474836480  # 20 GiB
+     kvFloorBytes: 4294967296  # 4 GiB
+
+Both are per device. With tensor or pipeline parallelism, declare what one rank
+costs on one GPU rather than what the whole model costs, because the control
+plane keeps its memory account per card.
+
+The footprint cannot be derived from the artifact size, since most of the gap
+between the two is allocator retention that does not scale with the weights.
+Take it from a run of this model with these engine arguments, under enough load
+to reach the engine's peak. Declaring more than the model needs wastes room and
+is safe; declaring less is not.
+
+The KV floor is spent the moment an instance is placed and does not come back
+while its engine is awake, because the engine's KV limit can be lowered towards
+that floor but never past it. A card can therefore be full in the sense that
+matters here while NVML still reports free memory on it.
+
+A claim that declares neither number is not scheduled: its ``Scheduled``
+condition is False with reason ``NumbersMissing``. A claim that declares them
+but finds no card with room stays Pending with reason ``InsufficientCapacity``,
+and retries on a backoff that starts at 10 seconds, doubles, and stops at 5
+minutes. The wait drops back to 10 seconds as soon as any card in the pool
+gains or loses an instance, so a model is placed within one reconcile of room
+appearing. If some candidate Pod could not be judged at all, because its
+runtime sidecar did not answer or because an instance already on it belongs to
+a claim that declared nothing, the reason is ``LedgerIncomplete`` instead and
+the message names the claim to fix.
 
 For example:
 

@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -144,6 +145,16 @@ func (f *fakeRuntime) Snapshot(_ context.Context, podIP string, _ int) (*Runtime
 		copy.Models = append([]RuntimeSnapshotModel(nil), snapshot.Models...)
 		result = &copy
 	}
+	// A warm GPU pod always has a card. Without one the ledger cannot size it
+	// and placement refuses the pod, which would make every test about
+	// something else fail for an unrelated reason.
+	if len(result.Accelerators) == 0 {
+		result.Accelerators = []RuntimeAcceleratorSnapshot{{
+			ID:            testAcceleratorName,
+			HBMTotalBytes: testHBMTotalBytes,
+			HBMFreeBytes:  testHBMTotalBytes,
+		}}
+	}
 	for _, model := range f.models {
 		present := false
 		for i := range result.Models {
@@ -218,9 +229,24 @@ func sampleModelClaim() *modelv1alpha1.ModelClaim {
 			EngineConfig: &modelv1alpha1.ModelClaimEngineConfig{
 				Args: map[string]string{"--max-model-len": "2048"},
 			},
+			PerGPU: &modelv1alpha1.ModelClaimPerGPU{
+				MaximumFootprintBytes: ptr.To(testFootprintBytes),
+				KVFloorBytes:          ptr.To(testKVFloorBytes),
+			},
 		},
 	}
 }
+
+// Placement now checks a declared cost against a card's ledger, so a warm pod
+// with no accelerator in its snapshot can hold nothing at all. These sizes give
+// every test pod room for several sample claims, leaving the tests that care
+// about capacity free to state their own numbers.
+const (
+	testFootprintBytes  int64 = 4 << 30
+	testKVFloorBytes    int64 = 2 << 30
+	testHBMTotalBytes   int64 = 80 << 30
+	testAcceleratorName       = "GPU-test-0"
+)
 
 func newReconciler(t *testing.T, objs ...client.Object) (*ModelClaimReconciler, *fakeRuntime) {
 	t.Helper()
@@ -232,11 +258,12 @@ func newReconciler(t *testing.T, objs ...client.Object) (*ModelClaimReconciler, 
 		Build()
 	runtime := &fakeRuntime{}
 	return &ModelClaimReconciler{
-		Client:     c,
-		Scheme:     scheme,
-		Recorder:   record.NewFakeRecorder(32),
-		Runtime:    runtime,
-		PoolPolicy: newPoolPolicyManager(time.Now),
+		Client:           c,
+		Scheme:           scheme,
+		Recorder:         record.NewFakeRecorder(32),
+		Runtime:          runtime,
+		PoolPolicy:       newPoolPolicyManager(time.Now),
+		PlacementBackoff: newPlacementBackoff(),
 		SnapshotCache: newRuntimeSnapshotCache(
 			defaultRuntimeSnapshotTTL, time.Now,
 		),
@@ -659,12 +686,19 @@ func TestReconcilePlacementPrefersRuntimeSnapshot(t *testing.T) {
 	hot.Status.PodIP = testPeerIP
 	r, runtime := newReconciler(t, pm, cold, hot)
 	runtime.snapshots = map[string]*RuntimeSnapshot{
+		// Both cards are large enough to hold the claim, so the ledger gate
+		// admits both and the ranking alone decides. The free-byte figures are
+		// only there to make the ranking's preference visible.
 		"10.0.0.1": {
-			Accelerators: []RuntimeAcceleratorSnapshot{{ID: "GPU-0", HBMFreeBytes: 900}},
-			Models:       []RuntimeSnapshotModel{{ModelName: "other", KVUsedBytes: 1}},
+			Accelerators: []RuntimeAcceleratorSnapshot{
+				{ID: "GPU-0", HBMTotalBytes: testHBMTotalBytes, HBMFreeBytes: 900},
+			},
+			Models: []RuntimeSnapshotModel{{ModelName: "other", KVUsedBytes: 1}},
 		},
 		testPeerIP: {
-			Accelerators:    []RuntimeAcceleratorSnapshot{{ID: "GPU-0", HBMFreeBytes: 100}},
+			Accelerators: []RuntimeAcceleratorSnapshot{
+				{ID: "GPU-0", HBMTotalBytes: testHBMTotalBytes, HBMFreeBytes: 100},
+			},
 			CachedArtifacts: []string{pm.Spec.ArtifactURL},
 		},
 	}

@@ -11,6 +11,9 @@ spec:
   artifactURL: huggingface://Qwen/Qwen3-0.6B
   engine: vllm
   replicas: 1
+  perGPU:
+    maximumFootprintBytes: 4294967296  # 4 GiB
+    kvFloorBytes: 2147483648  # 2 GiB
   engineConfig:
     args:
       --max-model-len: "2048"
@@ -28,6 +31,9 @@ spec:
   artifactURL: huggingface://Qwen/Qwen2.5-0.5B-Instruct
   engine: vllm
   replicas: 1
+  perGPU:
+    maximumFootprintBytes: 4294967296  # 4 GiB
+    kvFloorBytes: 2147483648  # 2 GiB
   engineConfig:
     args:
       --max-model-len: "2048"

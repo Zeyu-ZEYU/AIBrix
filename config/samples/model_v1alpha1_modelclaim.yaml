@@ -20,3 +20,13 @@ spec:
   artifactURL: huggingface://Qwen/Qwen2-7B-Instruct
   engine: vllm
   replicas: 1
+  # What one instance of this model costs on a single GPU. The control plane
+  # does not measure a model; it places one only where these numbers fit.
+  # With tensor parallelism they are per device, not for the whole model.
+  perGPU:
+    # Weights, captured CUDA graphs, activation workspaces and allocator
+    # retention. Take it from a run of this model with these engine arguments.
+    maximumFootprintBytes: 21474836480  # 20 GiB
+    # The KV cache this instance needs to serve one request of max_model_len.
+    # It is spent at placement and does not come back while the engine is awake.
+    kvFloorBytes: 4294967296  # 4 GiB

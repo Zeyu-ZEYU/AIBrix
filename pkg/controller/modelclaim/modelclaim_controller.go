@@ -87,17 +87,22 @@ type ModelClaimReconciler struct {
 	// request-counter deltas needed for conservative KV allocation. It is not a
 	// desired-state store; runtime snapshots remain authoritative after restart.
 	PoolPolicy *poolPolicyManager
+	// PlacementBackoff paces retries for claims no warm pod can hold, so a
+	// claim waiting on capacity costs almost nothing while still reacting to
+	// room appearing within one reconcile.
+	PlacementBackoff *placementBackoff
 }
 
 // Add creates a new ModelClaim controller and registers it with the Manager.
 func Add(mgr manager.Manager, _ config.RuntimeConfig) error {
 	r := &ModelClaimReconciler{
-		Client:     mgr.GetClient(),
-		Scheme:     mgr.GetScheme(),
-		Recorder:   mgr.GetEventRecorderFor(controllerName),
-		Runtime:    NewRuntimeClient(),
-		Locality:   uniformLocality{},
-		PoolPolicy: newPoolPolicyManager(time.Now),
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		Recorder:         mgr.GetEventRecorderFor(controllerName),
+		Runtime:          NewRuntimeClient(),
+		Locality:         uniformLocality{},
+		PoolPolicy:       newPoolPolicyManager(time.Now),
+		PlacementBackoff: newPlacementBackoff(),
 		SnapshotCache: newRuntimeSnapshotCache(
 			defaultRuntimeSnapshotTTL, time.Now,
 		),
@@ -144,6 +149,7 @@ func (r *ModelClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if controllerutil.ContainsFinalizer(pm, ModelClaimFinalizer) {
 			r.deactivateInstances(ctx, pm)
 			clearClaimMetrics(pm.Namespace, servedModelName(pm))
+			r.PlacementBackoff.Forget(req.NamespacedName)
 			controllerutil.RemoveFinalizer(pm, ModelClaimFinalizer)
 			if err := r.Update(ctx, pm); err != nil {
 				return requeueOnConflict(err)
@@ -193,9 +199,12 @@ func (r *ModelClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	// Drive the model towards its desired number of active instances by
 	// bin-packing onto warm pods and asking the runtime sidecar to activate it.
+	placementRetryAfter := time.Duration(0)
 	switch {
 	case desiredReplicas(pm) > int32(len(pm.Status.Instances)):
-		if err := r.ensureActivated(ctx, pm, candidates); err != nil {
+		retryAfter, err := r.ensureActivated(ctx, pm, candidates)
+		placementRetryAfter = retryAfter
+		if err != nil {
 			r.Recorder.Event(pm, corev1.EventTypeWarning, "ActivateFailed", err.Error())
 			meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
 				Type:    string(modelv1alpha1.ModelClaimConditionReady),
@@ -226,6 +235,13 @@ func (r *ModelClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// claim status is persisted so a policy failure cannot block activation
 	// or route-health convergence for this claim.
 	r.reconcilePoolPolicies(ctx, candidates)
+	// A claim that could not be placed comes back on its own backoff instead of
+	// the fixed reconcile pace. Every other path keeps the old cadence, so a
+	// claim waiting on room never slows down health or routing convergence for
+	// the claims that are actually running.
+	if placementRetryAfter > 0 {
+		return ctrl.Result{RequeueAfter: placementRetryAfter}, nil
+	}
 	return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, nil
 }
 
@@ -386,28 +402,60 @@ func (r *ModelClaimReconciler) recomputeReadiness(pm *modelv1alpha1.ModelClaim) 
 // warm pods and asking the runtime sidecar to activate an engine process on
 // each. Lack of an available warm pod is not an error (the model stays Pending and
 // reconciles again); only runtime failures propagate.
-func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1alpha1.ModelClaim, candidates []corev1.Pod) error {
+//
+// The returned duration is how long to wait before retrying a placement that
+// did not happen. Zero means this round placed everything it needed to and the
+// ordinary reconcile pace applies.
+func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1alpha1.ModelClaim, candidates []corev1.Pod) (time.Duration, error) {
+	claimKey := types.NamespacedName{Namespace: pm.Namespace, Name: pm.Name}
+
+	// The control plane does not measure what a model costs; the user declares
+	// it. Without the declaration there is nothing to check a card against, so
+	// the claim waits rather than being placed on a guess. The generation is
+	// the backoff fingerprint here, so correcting the spec retries at once.
+	minimumReserveBytes, declared := claimMinimumReserveBytes(pm)
+	if !declared {
+		message := "spec.perGPU must declare maximumFootprintBytes and kvFloorBytes"
+		r.Recorder.Event(pm, corev1.EventTypeWarning, reasonNumbersMissing, message)
+		retryAfter := r.PlacementBackoff.Next(claimKey, uint64(pm.Generation))
+		meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
+			Type:    string(modelv1alpha1.ModelClaimConditionTypeScheduled),
+			Status:  metav1.ConditionFalse,
+			Reason:  reasonNumbersMissing,
+			Message: message,
+		})
+		return retryAfter, nil
+	}
+
 	load := r.computePodLoad(ctx, pm.Namespace)
 	parallelism, err := modelParallelism(pm)
 	if err != nil {
-		return fmt.Errorf("invalid engineConfig parallelism: %w", err)
+		return 0, fmt.Errorf("invalid engineConfig parallelism: %w", err)
 	}
 	placementStates := r.collectPlacementStates(ctx, candidates, pm.Spec.ArtifactURL, parallelism)
+	ledgers := r.collectPodLedgers(ctx, pm.Namespace, candidates, placementStates)
 
 	for desiredReplicas(pm) > int32(len(pm.Status.Instances)) {
-		pod, selectErr := selectPodForActivationWithState(
+		// Ranking and admission are separate passes. Ranking puts artifact
+		// locality first, so its favourite pod is often the fullest one; the
+		// walk down the list is what finds a pod that actually has room.
+		ordered := rankCandidates(
 			candidates, instancePods(pm), load, servedModelName(pm), r.Locality, placementStates,
 		)
-		if selectErr != nil {
-			// No available warm pod right now; remain Pending and retry on requeue.
-			r.Recorder.Event(pm, corev1.EventTypeWarning, "NoMatchingPods", selectErr.Error())
+		pod, refusals := selectPodForPlacement(ordered, ledgers, minimumReserveBytes)
+		if pod == nil {
+			reason, message := summarizeRefusals(refusals, minimumReserveBytes)
+			retryAfter := r.PlacementBackoff.Next(claimKey, ledgerFingerprint(ledgers))
+			// The event text stays free of the retry delay so identical rounds
+			// collapse into one counted event instead of flooding the stream.
+			r.Recorder.Event(pm, corev1.EventTypeWarning, placementEventReason(reason), message)
 			meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
 				Type:    string(modelv1alpha1.ModelClaimConditionTypeScheduled),
 				Status:  metav1.ConditionFalse,
-				Reason:  "NoMatchingPods",
-				Message: selectErr.Error(),
+				Reason:  reason,
+				Message: fmt.Sprintf("%s; retrying in %s", message, retryAfter),
 			})
-			return nil
+			return retryAfter, nil
 		}
 
 		resp, aerr := r.Runtime.Activate(ctx, pod.Status.PodIP, DefaultRuntimePort, &ActivateRequest{
@@ -424,7 +472,7 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 		})
 		if aerr != nil {
 			recordActivation(pm.Namespace, servedModelName(pm), false)
-			return aerr
+			return 0, aerr
 		}
 
 		// The engine is spawned but not yet serveable (boot/compile). Keep the
@@ -433,7 +481,7 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 		// confirms the engine is ready, then it flips the annotation to the real
 		// port. This means the gateway never routes to a still-booting engine.
 		if err := r.annotateWarmPod(ctx, pm, pod, 0); err != nil {
-			return err
+			return 0, err
 		}
 
 		pm.Status.Instances = append(pm.Status.Instances, modelv1alpha1.ModelClaimInstance{
@@ -442,10 +490,35 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 			Phase: modelv1alpha1.ModelClaimActivating,
 		})
 		load[pod.Name]++
+		// Charge the card now, so a second instance in this same round sees the
+		// space the first one just took rather than counting it twice.
+		ledger := ledgers[pod.Name]
+		ledger.Instances = append(ledger.Instances, ledgerInstance{
+			Claim:                 claimKey,
+			MaximumFootprintBytes: *pm.Spec.PerGPU.MaximumFootprintBytes,
+			KVFloorBytes:          *pm.Spec.PerGPU.KVFloorBytes,
+		})
+		ledgers[pod.Name] = ledger
 		r.Recorder.Eventf(pm, corev1.EventTypeNormal, "Activating",
 			"model %s engine starting on pod %s:%d", servedModelName(pm), pod.Name, resp.Port)
 	}
-	return nil
+	r.PlacementBackoff.Forget(claimKey)
+	return 0, nil
+}
+
+// reasonNumbersMissing is the condition reason for a claim that never declared
+// what it costs on a GPU. It is separate from a capacity refusal because no
+// amount of waiting fixes it; only an edit to the spec does.
+const reasonNumbersMissing = "NumbersMissing"
+
+// placementEventReason maps a condition reason to the event an operator
+// watches for. Running out of GPU memory has one agreed event name across the
+// design, while the other reasons are their own event.
+func placementEventReason(conditionReason string) string {
+	if conditionReason == refusalInsufficientCapacity {
+		return "PlacementOutOfMemory"
+	}
+	return conditionReason
 }
 
 func (r *ModelClaimReconciler) collectPlacementStates(

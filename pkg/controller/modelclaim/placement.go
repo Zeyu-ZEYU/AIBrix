@@ -18,10 +18,12 @@ package modelclaim
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	modelv1alpha1 "github.com/vllm-project/aibrix/api/model/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // servedModelName returns the model name clients address, defaulting to the
@@ -105,30 +107,157 @@ func selectPodForActivationWithState(
 	locality LocalityProvider,
 	states map[string]PodPlacementState,
 ) (*corev1.Pod, error) {
+	ordered := rankCandidates(candidates, alreadyOn, load, model, locality, states)
+	if len(ordered) == 0 {
+		return nil, fmt.Errorf("no available candidate warm pod for model")
+	}
+	return ordered[0], nil
+}
+
+// rankCandidates orders every pod that could take this model, best first. It
+// only ranks: preference and admission are separate questions, and mixing them
+// would let artifact locality win a pod that has no room at all.
+//
+// The comparison is the one the previous single-winner search used, so the
+// head of this list is the pod that search would have returned. It ends in a
+// name comparison and is therefore a strict total order over distinct pods,
+// which makes the sort deterministic.
+func rankCandidates(
+	candidates []corev1.Pod,
+	alreadyOn map[string]bool,
+	load map[string]int,
+	model string,
+	locality LocalityProvider,
+	states map[string]PodPlacementState,
+) []*corev1.Pod {
 	if locality == nil {
 		locality = uniformLocality{}
 	}
-	var best *corev1.Pod
-	var bestState PodPlacementState
-	var bestLoc float64
-	var bestLoad int
+	ordered := make([]*corev1.Pod, 0, len(candidates))
 	for i := range candidates {
-		pod := &candidates[i]
-		if alreadyOn[pod.Name] {
+		if alreadyOn[candidates[i].Name] {
 			continue
 		}
-		state := states[pod.Name]
-		loc := locality.Cost(model, pod.Spec.NodeName)
-		l := load[pod.Name]
-		if best == nil || placementStateLess(state, bestState) ||
-			(!placementStateLess(bestState, state) && rankLess(loc, l, pod.Name, bestLoc, bestLoad, best.Name)) {
-			best, bestState, bestLoc, bestLoad = pod, state, loc, l
+		ordered = append(ordered, &candidates[i])
+	}
+	sort.SliceStable(ordered, func(i, j int) bool {
+		a, b := ordered[i], ordered[j]
+		stateA, stateB := states[a.Name], states[b.Name]
+		if placementStateLess(stateA, stateB) {
+			return true
+		}
+		if placementStateLess(stateB, stateA) {
+			return false
+		}
+		return rankLess(
+			locality.Cost(model, a.Spec.NodeName), load[a.Name], a.Name,
+			locality.Cost(model, b.Spec.NodeName), load[b.Name], b.Name,
+		)
+	})
+	return ordered
+}
+
+// Refusal reasons are fixed strings because they reach an operator as a
+// condition reason. They separate two situations an operator has to act on
+// differently: a card that provably cannot hold the model needs capacity
+// added or a model removed, while a ledger that could not be read needs a
+// sidecar or a ModelClaim fixed.
+const (
+	refusalInsufficientCapacity = "InsufficientCapacity"
+	refusalLedgerIncomplete     = "LedgerIncomplete"
+)
+
+// podRefusal records why one pod could not take the model, so the claim can
+// say which pods were considered and what stopped each of them.
+type podRefusal struct {
+	Pod              string
+	Reason           string
+	MaximumRoomBytes int64
+	RoomKnown        bool
+	Missing          ledgerMissing
+	UndeclaredClaim  types.NamespacedName
+}
+
+// selectPodForPlacement walks the ranked pods and returns the first one whose
+// ledger proves it can hold a model needing minimumReserveBytes.
+//
+// Walking matters: ranking puts artifact locality first, so the best-ranked
+// pod is routinely the fullest one, and room does not decrease down the list.
+// A pod that fails here is skipped, not fatal to the round.
+//
+// This is the first of the design's gates, the only one that can prove a
+// placement impossible: maximumRoomBytes is what the card could offer if every
+// engine on it went down to its KV floor, which needs sleeps and is therefore
+// the most room that will ever exist there. Needing more than that cannot be
+// fixed by waiting. The gates that decide whether a placement is merely
+// inconvenient, against currentRoomBytes and minimumRoomBytes, are not
+// implemented yet, so a pod that passes here is placed on directly.
+func selectPodForPlacement(
+	ordered []*corev1.Pod,
+	ledgers map[string]podLedger,
+	minimumReserveBytes int64,
+) (*corev1.Pod, []podRefusal) {
+	refusals := make([]podRefusal, 0, len(ordered))
+	for _, pod := range ordered {
+		ledger, tracked := ledgers[pod.Name]
+		if !tracked {
+			ledger = podLedger{Missing: missingSnapshot}
+		}
+		room, known := ledger.MaximumRoomBytes()
+		if !known {
+			refusals = append(refusals, podRefusal{
+				Pod:             pod.Name,
+				Reason:          refusalLedgerIncomplete,
+				Missing:         ledger.Missing,
+				UndeclaredClaim: ledger.UndeclaredClaim,
+			})
+			continue
+		}
+		if room < minimumReserveBytes {
+			refusals = append(refusals, podRefusal{
+				Pod:              pod.Name,
+				Reason:           refusalInsufficientCapacity,
+				MaximumRoomBytes: room,
+				RoomKnown:        true,
+			})
+			continue
+		}
+		return pod, refusals
+	}
+	return nil, refusals
+}
+
+// summarizeRefusals turns the per-pod record into the one reason and message a
+// claim carries. An unreadable ledger outranks a full card, because a pod
+// nobody could measure may well have had room.
+func summarizeRefusals(refusals []podRefusal, minimumReserveBytes int64) (string, string) {
+	if len(refusals) == 0 {
+		return "NoMatchingPods", "no warm pod matched the claim's selector"
+	}
+	reason := refusalInsufficientCapacity
+	bestRoom, bestKnown := int64(0), false
+	var incomplete *podRefusal
+	for i := range refusals {
+		refusal := &refusals[i]
+		if refusal.Reason == refusalLedgerIncomplete && incomplete == nil {
+			incomplete = refusal
+		}
+		if refusal.RoomKnown && (!bestKnown || refusal.MaximumRoomBytes > bestRoom) {
+			bestRoom, bestKnown = refusal.MaximumRoomBytes, true
 		}
 	}
-	if best == nil {
-		return nil, fmt.Errorf("no available candidate warm pod for model")
+	if incomplete != nil {
+		reason = refusalLedgerIncomplete
+		message := fmt.Sprintf("%d candidate pod(s) refused; pod %s could not be judged: %s",
+			len(refusals), incomplete.Pod, incomplete.Missing)
+		if incomplete.Missing == missingClaimNumbers {
+			message += fmt.Sprintf(" (%s)", incomplete.UndeclaredClaim)
+		}
+		return reason, message
 	}
-	return best, nil
+	return reason, fmt.Sprintf(
+		"%d candidate pod(s) refused; model needs %d bytes per GPU, the roomiest pod could free at most %d",
+		len(refusals), minimumReserveBytes, bestRoom)
 }
 
 // placementStateLess returns whether a ranks ahead of b using live runtime
