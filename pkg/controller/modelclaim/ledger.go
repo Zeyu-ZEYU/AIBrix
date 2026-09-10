@@ -236,6 +236,13 @@ func (r *ModelClaimReconciler) collectPodLedgers(
 		_, declared := claimMinimumReserveBytes(claim)
 		key := types.NamespacedName{Namespace: claim.Namespace, Name: claim.Name}
 		for _, instance := range claim.Status.Instances {
+			// A failed instance has exhausted its restarts and its engine
+			// process is gone, so its memory is back with the card. Charging
+			// the card for it would take a slice of GPU out of circulation for
+			// as long as the claim exists, and nothing would ever put it back.
+			if instance.Phase == modelv1alpha1.ModelClaimFailed {
+				continue
+			}
 			ledger, tracked := ledgers[instance.Pod]
 			if !tracked || !ledger.accountable() {
 				continue

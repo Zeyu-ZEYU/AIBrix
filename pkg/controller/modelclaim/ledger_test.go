@@ -254,6 +254,51 @@ func TestCollectPodLedgers(t *testing.T) {
 		assert.Equal(t, usable, empty)
 	})
 
+	t.Run("a failed instance no longer holds the memory it was charged", func(t *testing.T) {
+		dead := ledgerClaim("dead", "warm-1", 20*gibibyte, 4*gibibyte)
+		dead.Status.Instances[0].Phase = modelv1alpha1.ModelClaimFailed
+		r, _ := newReconciler(t, dead)
+		candidates := pods("warm-1")
+		states := r.collectPlacementStates(context.Background(), candidates, "artifact", 1)
+		ledgers := r.collectPodLedgers(context.Background(), testNamespace, candidates, states)
+
+		assert.Empty(t, ledgers["warm-1"].Instances)
+		room, known := ledgers["warm-1"].MaximumRoomBytes()
+		require.True(t, known)
+		assert.Equal(t, usable, room, "the card is whole again")
+	})
+
+	t.Run("a failed instance whose claim declared nothing does not blind the card", func(t *testing.T) {
+		// A claim from before spec.perGPU existed, whose engine then died,
+		// must not make its card unusable for everyone else forever.
+		dead := ledgerClaim("legacy", "warm-1", 0, 0)
+		dead.Status.Instances[0].Phase = modelv1alpha1.ModelClaimFailed
+		r, _ := newReconciler(t, dead)
+		candidates := pods("warm-1")
+		states := r.collectPlacementStates(context.Background(), candidates, "artifact", 1)
+		ledgers := r.collectPodLedgers(context.Background(), testNamespace, candidates, states)
+
+		assert.Equal(t, missingNothing, ledgers["warm-1"].Missing)
+		room, known := ledgers["warm-1"].MaximumRoomBytes()
+		require.True(t, known)
+		assert.Equal(t, usable, room)
+	})
+
+	t.Run("an activating instance is charged before its engine is ready", func(t *testing.T) {
+		// Placement has already committed the memory; waiting for readiness
+		// would let a second claim be placed against the same bytes.
+		booting := ledgerClaim("booting", "warm-1", 20*gibibyte, 4*gibibyte)
+		booting.Status.Instances[0].Phase = modelv1alpha1.ModelClaimActivating
+		r, _ := newReconciler(t, booting)
+		candidates := pods("warm-1")
+		states := r.collectPlacementStates(context.Background(), candidates, "artifact", 1)
+		ledgers := r.collectPodLedgers(context.Background(), testNamespace, candidates, states)
+
+		require.Len(t, ledgers["warm-1"].Instances, 1)
+		room, _ := ledgers["warm-1"].MaximumRoomBytes()
+		assert.Equal(t, usable-24*gibibyte, room)
+	})
+
 	t.Run("an instance on a pod outside the candidates is ignored", func(t *testing.T) {
 		elsewhere := ledgerClaim("elsewhere", "other-pod", 20*gibibyte, 4*gibibyte)
 		r, _ := newReconciler(t, elsewhere)
