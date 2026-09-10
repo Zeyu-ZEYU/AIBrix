@@ -64,6 +64,17 @@ spec:
                 type: object
               modelName:
                 type: string
+              perGPU:
+                properties:
+                  kvFloorBytes:
+                    format: int64
+                    minimum: 1
+                    type: integer
+                  maximumFootprintBytes:
+                    format: int64
+                    minimum: 1
+                    type: integer
+                type: object
               podSelector:
                 properties:
                   matchExpressions:

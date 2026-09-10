@@ -65,6 +65,38 @@ type ModelClaimSpec struct {
 	// CLI flags to their values, e.g. {"--max-model-len": "2048"}.
 	// +optional
 	EngineConfig *ModelClaimEngineConfig `json:"engineConfig,omitempty"`
+
+	// PerGPU declares what this model costs on one GPU. The control plane does
+	// not profile a model to discover these numbers; they come from the user.
+	// +optional
+	PerGPU *ModelClaimPerGPU `json:"perGPU,omitempty"`
+}
+
+// ModelClaimPerGPU is what a user declares about one instance's cost on a
+// single GPU. With tensor or pipeline parallelism the values describe one
+// device and not the whole model, since a model's memory is spent per card.
+// Declaring the whole model's cost instead overstates the need by the
+// parallelism degree, which wastes room but never overcommits a card.
+type ModelClaimPerGPU struct {
+	// MaximumFootprintBytes is the largest non-KV GPU memory this instance
+	// will hold on one device: weights, captured CUDA graphs, activation
+	// workspaces and allocator retention. It cannot be derived from the
+	// artifact size, because most of the gap between the two is allocator
+	// retention that does not scale with the weights, so it has to come from a
+	// run of this model with these engine arguments. Declaring more than the
+	// model needs wastes room and is safe; declaring less is not.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	MaximumFootprintBytes *int64 `json:"maximumFootprintBytes,omitempty"`
+
+	// KVFloorBytes is the KV cache this instance must keep on one device to
+	// serve at all: enough for one request of max_model_len at this model's
+	// bytes per token, rounded up to the KV allocator's page granularity. An
+	// engine's KV limit can be lowered towards this floor but never past it,
+	// so the memory is held for as long as the engine is awake.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	KVFloorBytes *int64 `json:"kvFloorBytes,omitempty"`
 }
 
 // ModelClaimEngineConfig describes engine-specific startup options.
