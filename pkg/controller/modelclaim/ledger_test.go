@@ -132,6 +132,14 @@ func TestMaximumRoomBytes(t *testing.T) {
 			wantKnown: true,
 		},
 		{
+			name:   "the zero value knows nothing, it does not report a full card",
+			ledger: podLedger{},
+		},
+		{
+			name:   "a pod with no GPU has no answer either",
+			ledger: podLedger{NoGPU: true},
+		},
+		{
 			name:   "no snapshot means no answer",
 			ledger: podLedger{Missing: missingSnapshot},
 		},
@@ -397,7 +405,7 @@ func TestCollectPodLedgers(t *testing.T) {
 
 	t.Run("a pod Kubernetes gave no GPU is outside the account", func(t *testing.T) {
 		r, _ := newReconciler(t)
-		candidates := []corev1.Pod{*warmPod("warm-1", "b300-pool-a", true, corev1.PodRunning)}
+		candidates := []corev1.Pod{*cpuOnlyWarmPod("warm-1", "b300-pool-a")}
 		ledgers := collectLedgers(t, r, candidates)
 
 		assert.True(t, ledgers["warm-1"].NoGPU)
@@ -409,7 +417,7 @@ func TestCollectPodLedgers(t *testing.T) {
 	t.Run("an instance on a pod with no GPU is not charged anywhere", func(t *testing.T) {
 		resident := ledgerClaim("resident", "warm-1", 20*gibibyte, 4*gibibyte)
 		r, _ := newReconciler(t, resident)
-		candidates := []corev1.Pod{*warmPod("warm-1", "b300-pool-a", true, corev1.PodRunning)}
+		candidates := []corev1.Pod{*cpuOnlyWarmPod("warm-1", "b300-pool-a")}
 		ledgers := collectLedgers(t, r, candidates)
 
 		assert.Empty(t, ledgers["warm-1"].Instances)

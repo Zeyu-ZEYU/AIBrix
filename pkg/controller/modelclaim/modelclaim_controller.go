@@ -66,6 +66,12 @@ const (
 	// DefaultRequeueDuration paces periodic reconciliation (placement retries
 	// and readiness checks).
 	DefaultRequeueDuration = 10 * time.Second
+
+	// reasonInsufficientCapacity marks a claim that matched warm pods but was
+	// turned down by all of them for GPU memory. It is separate from
+	// NoMatchingPods because the two call for different actions: add capacity
+	// or remove a model, against fix the selector or add pods.
+	reasonInsufficientCapacity = "InsufficientCapacity"
 )
 
 // ModelClaimReconciler reconciles a ModelClaim object.
@@ -393,22 +399,34 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 		return fmt.Errorf("invalid engineConfig parallelism: %w", err)
 	}
 	placementStates := r.collectPlacementStates(ctx, candidates, pm.Spec.ArtifactURL, parallelism)
+	// A claim that declared no cost is placed exactly as it was before this
+	// check existed: there is nothing to compare a card against.
+	minimumReserveBytes, _ := claimMinimumReserveBytes(pm)
+	ledgers := r.collectPodLedgers(ctx, pm.Namespace, candidates, placementStates)
 
 	for desiredReplicas(pm) > int32(len(pm.Status.Instances)) {
-		pod, selectErr := selectPodForActivationWithState(
-			candidates, instancePods(pm), load, servedModelName(pm), r.Locality, placementStates,
-		)
-		if selectErr != nil {
+		feasible, refusals := filterCandidates(candidates, instancePods(pm), ledgers, minimumReserveBytes)
+		ordered := rankCandidates(feasible, load, servedModelName(pm), r.Locality, placementStates)
+		if len(ordered) == 0 {
 			// No available warm pod right now; remain Pending and retry on requeue.
-			r.Recorder.Event(pm, corev1.EventTypeWarning, "NoMatchingPods", selectErr.Error())
+			// Being turned down for memory is worth telling apart from matching
+			// no pod at all: one asks for capacity, the other for a different
+			// selector or more pods.
+			reason, message := "NoMatchingPods", "no available candidate warm pod for model"
+			if len(refusals) > 0 {
+				reason = reasonInsufficientCapacity
+				message = summarizeRefusals(refusals, minimumReserveBytes)
+			}
+			r.Recorder.Event(pm, corev1.EventTypeWarning, reason, message)
 			meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
 				Type:    string(modelv1alpha1.ModelClaimConditionTypeScheduled),
 				Status:  metav1.ConditionFalse,
-				Reason:  "NoMatchingPods",
-				Message: selectErr.Error(),
+				Reason:  reason,
+				Message: message,
 			})
 			return nil
 		}
+		pod := ordered[0]
 
 		resp, aerr := r.Runtime.Activate(ctx, pod.Status.PodIP, DefaultRuntimePort, &ActivateRequest{
 			ModelName:    servedModelName(pm),
@@ -442,6 +460,17 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 			Phase: modelv1alpha1.ModelClaimActivating,
 		})
 		load[pod.Name]++
+		// Charge the card now, so a second instance in this same round sees
+		// the space the first one just took rather than counting it twice.
+		if minimumReserveBytes > 0 {
+			ledger := ledgers[pod.Name]
+			ledger.Instances = append(ledger.Instances, ledgerInstance{
+				Claim:                 types.NamespacedName{Namespace: pm.Namespace, Name: pm.Name},
+				MaximumFootprintBytes: *pm.Spec.PerGPU.MaximumFootprintBytes,
+				KVFloorBytes:          *pm.Spec.PerGPU.KVFloorBytes,
+			})
+			ledgers[pod.Name] = ledger
+		}
 		r.Recorder.Eventf(pm, corev1.EventTypeNormal, "Activating",
 			"model %s engine starting on pod %s:%d", servedModelName(pm), pod.Name, resp.Port)
 	}

@@ -137,10 +137,13 @@ func (l podLedger) accountable() bool {
 // model needing more than this cannot be placed here by waiting. The value can
 // be negative if the card is already promised more than it has.
 //
-// The second return is false when the ledger is incomplete, in which case the
-// first has no meaning.
+// The second return is false when the ledger cannot answer, in which case the
+// first has no meaning. A card of no usable size is one of those cases and not
+// a full card: the zero value of this type is what a lookup for an untracked
+// pod produces, and it must mean "nothing is known" rather than "nothing is
+// left".
 func (l podLedger) MaximumRoomBytes() (int64, bool) {
-	if l.Missing != missingNothing {
+	if l.Missing != missingNothing || l.HBMUsableBytes <= 0 {
 		return 0, false
 	}
 	room := l.HBMUsableBytes

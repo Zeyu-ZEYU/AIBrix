@@ -24,6 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	modelv1alpha1 "github.com/vllm-project/aibrix/api/model/v1alpha1"
 )
@@ -32,34 +33,62 @@ func namedPod(name string) corev1.Pod {
 	return corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name}}
 }
 
+// mustFilter runs the filter with no ledger, for the tests that are about the
+// other constraints and say nothing about memory.
+func mustFilter(candidates []corev1.Pod, alreadyOn map[string]bool) []*corev1.Pod {
+	feasible, refusals := filterCandidates(candidates, alreadyOn, nil, 0)
+	if len(refusals) != 0 {
+		panic("filter refused a pod for memory with no ledger and no declared cost")
+	}
+	return feasible
+}
+
+// topChoice composes the filter and the ranker the way the controller does,
+// with no ledger, so the tests written before the split keep asserting exactly
+// what they always did. Nil means every candidate was filtered out.
+func topChoice(
+	candidates []corev1.Pod,
+	alreadyOn map[string]bool,
+	load map[string]int,
+	model string,
+	locality LocalityProvider,
+	states map[string]PodPlacementState,
+) *corev1.Pod {
+	feasible, _ := filterCandidates(candidates, alreadyOn, nil, 0)
+	ordered := rankCandidates(feasible, load, model, locality, states)
+	if len(ordered) == 0 {
+		return nil
+	}
+	return ordered[0]
+}
+
 func TestSelectPodForActivation_LeastLoaded(t *testing.T) {
 	cands := []corev1.Pod{namedPod("a"), namedPod("b"), namedPod("c")}
 	load := map[string]int{"a": 2, "b": 0, "c": 1}
-	got, err := selectPodForActivation(cands, map[string]bool{}, load, "m", uniformLocality{})
-	require.NoError(t, err)
+	got := topChoice(cands, map[string]bool{}, load, "m", uniformLocality{}, nil)
+	require.NotNil(t, got)
 	assert.Equal(t, "b", got.Name)
 }
 
 func TestSelectPodForActivation_SkipsAlreadyOn(t *testing.T) {
 	cands := []corev1.Pod{namedPod("a"), namedPod("b")}
 	load := map[string]int{"a": 0, "b": 5}
-	got, err := selectPodForActivation(cands, map[string]bool{"a": true}, load, "m", uniformLocality{})
-	require.NoError(t, err)
+	got := topChoice(cands, map[string]bool{"a": true}, load, "m", uniformLocality{}, nil)
+	require.NotNil(t, got)
 	assert.Equal(t, "b", got.Name, "a is excluded even though least loaded")
 }
 
 func TestSelectPodForActivation_TieBreakByName(t *testing.T) {
 	cands := []corev1.Pod{namedPod("z"), namedPod("a")}
 	load := map[string]int{"z": 0, "a": 0}
-	got, err := selectPodForActivation(cands, map[string]bool{}, load, "m", uniformLocality{})
-	require.NoError(t, err)
+	got := topChoice(cands, map[string]bool{}, load, "m", uniformLocality{}, nil)
+	require.NotNil(t, got)
 	assert.Equal(t, "a", got.Name)
 }
 
 func TestSelectPodForActivation_NoCapacity(t *testing.T) {
 	cands := []corev1.Pod{namedPod("a")}
-	_, err := selectPodForActivation(cands, map[string]bool{"a": true}, map[string]int{}, "m", uniformLocality{})
-	assert.Error(t, err)
+	assert.Nil(t, topChoice(cands, map[string]bool{"a": true}, map[string]int{}, "m", uniformLocality{}, nil))
 }
 
 func TestServedModelName(t *testing.T) {
@@ -108,8 +137,8 @@ func TestSelectPodForActivation_LocalityDominatesLoad(t *testing.T) {
 	cands := []corev1.Pod{podOnNode("cold", "n-cold"), podOnNode("hot", "n-hot")}
 	load := map[string]int{"cold": 0, "hot": 3}
 	loc := fakeLocality{"n-hot": 0, "n-cold": 5}
-	got, err := selectPodForActivation(cands, map[string]bool{}, load, "m", loc)
-	require.NoError(t, err)
+	got := topChoice(cands, map[string]bool{}, load, "m", loc, nil)
+	require.NotNil(t, got)
 	assert.Equal(t, "hot", got.Name, "lower locality cost wins over lower load")
 }
 
@@ -118,8 +147,8 @@ func TestSelectPodForActivation_LoadBreaksEqualLocality(t *testing.T) {
 	cands := []corev1.Pod{podOnNode("a", "n1"), podOnNode("b", "n2")}
 	load := map[string]int{"a": 2, "b": 1}
 	loc := fakeLocality{"n1": 0, "n2": 0}
-	got, err := selectPodForActivation(cands, map[string]bool{}, load, "m", loc)
-	require.NoError(t, err)
+	got := topChoice(cands, map[string]bool{}, load, "m", loc, nil)
+	require.NotNil(t, got)
 	assert.Equal(t, "b", got.Name)
 }
 
@@ -127,8 +156,8 @@ func TestSelectPodForActivation_NilLocalityIsUniform(t *testing.T) {
 	// A nil provider must not panic and must behave like load-only selection.
 	cands := []corev1.Pod{podOnNode("a", "n1"), podOnNode("b", "n2")}
 	load := map[string]int{"a": 5, "b": 0}
-	got, err := selectPodForActivation(cands, map[string]bool{}, load, "m", nil)
-	require.NoError(t, err)
+	got := topChoice(cands, map[string]bool{}, load, "m", nil, nil)
+	require.NotNil(t, got)
 	assert.Equal(t, "b", got.Name)
 }
 
@@ -152,10 +181,10 @@ func TestSelectPodForActivationWithStatePrefersLiveRuntimeState(t *testing.T) {
 		},
 	}
 
-	got, err := selectPodForActivationWithState(
+	got := topChoice(
 		candidates, map[string]bool{}, map[string]int{}, "m", uniformLocality{}, states,
 	)
-	require.NoError(t, err)
+	require.NotNil(t, got)
 	assert.Equal(t, "hot", got.Name, "cached artifact wins before live memory tie-breakers")
 }
 
@@ -178,16 +207,16 @@ func TestSelectPodForActivationWithStateRanksMemoryAndKV(t *testing.T) {
 		},
 	}
 
-	got, err := selectPodForActivationWithState(
+	got := topChoice(
 		candidates, map[string]bool{}, map[string]int{}, "m", uniformLocality{}, states,
 	)
-	require.NoError(t, err)
+	require.NotNil(t, got)
 	assert.Equal(t, "free", got.Name, "higher free HBM wins before KV/model-count tie-breakers")
 }
 
 func TestSelectPodForActivationWithStateFallsBackForUnknownSnapshots(t *testing.T) {
 	candidates := []corev1.Pod{namedPod("busy"), namedPod("idle")}
-	got, err := selectPodForActivationWithState(
+	got := topChoice(
 		candidates,
 		map[string]bool{},
 		map[string]int{"busy": 2, "idle": 0},
@@ -195,7 +224,7 @@ func TestSelectPodForActivationWithStateFallsBackForUnknownSnapshots(t *testing.
 		uniformLocality{},
 		map[string]PodPlacementState{},
 	)
-	require.NoError(t, err)
+	require.NotNil(t, got)
 	assert.Equal(t, "idle", got.Name)
 }
 
@@ -221,7 +250,7 @@ func TestPruneDeadInstances(t *testing.T) {
 
 func TestFilterCandidatesDropsPodsAlreadyHostingTheModel(t *testing.T) {
 	candidates := []corev1.Pod{namedPod("a"), namedPod("b"), namedPod("c")}
-	feasible := filterCandidates(candidates, map[string]bool{"b": true})
+	feasible := mustFilter(candidates, map[string]bool{"b": true})
 
 	names := make([]string, 0, len(feasible))
 	for _, pod := range feasible {
@@ -235,7 +264,7 @@ func TestFilterCandidatesKeepsTheInputOrder(t *testing.T) {
 	// would be expressed by a function that is supposed to express only
 	// feasibility.
 	candidates := []corev1.Pod{namedPod("z"), namedPod("a"), namedPod("m")}
-	feasible := filterCandidates(candidates, map[string]bool{})
+	feasible := mustFilter(candidates, map[string]bool{})
 
 	require.Len(t, feasible, 3)
 	assert.Equal(t, "z", feasible[0].Name)
@@ -244,8 +273,8 @@ func TestFilterCandidatesKeepsTheInputOrder(t *testing.T) {
 }
 
 func TestFilterCandidatesOnEmptyInput(t *testing.T) {
-	assert.Empty(t, filterCandidates(nil, map[string]bool{}))
-	assert.Empty(t, filterCandidates([]corev1.Pod{namedPod("a")}, map[string]bool{"a": true}))
+	assert.Empty(t, mustFilter(nil, map[string]bool{}))
+	assert.Empty(t, mustFilter([]corev1.Pod{namedPod("a")}, map[string]bool{"a": true}))
 }
 
 func rankedNames(pods []*corev1.Pod) []string {
@@ -303,7 +332,7 @@ func TestRankCandidatesOrdersEveryPodNotJustTheWinner(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			feasible := filterCandidates(tc.pods, map[string]bool{})
+			feasible := mustFilter(tc.pods, map[string]bool{})
 			ordered := rankCandidates(feasible, tc.load, "m", uniformLocality{}, tc.states)
 			assert.Equal(t, tc.want, rankedNames(ordered))
 		})
@@ -411,7 +440,7 @@ func TestRankCandidatesHeadMatchesTheSingleWinnerSearch(t *testing.T) {
 		}
 		want := legacySelectPodForActivation(candidates, alreadyOn, load, "m", localityArg, states)
 		ordered := rankCandidates(
-			filterCandidates(candidates, alreadyOn), load, "m", localityArg, states,
+			mustFilter(candidates, alreadyOn), load, "m", localityArg, states,
 		)
 
 		if want == nil {
@@ -421,4 +450,166 @@ func TestRankCandidatesHeadMatchesTheSingleWinnerSearch(t *testing.T) {
 		require.NotEmptyf(t, ordered, "round %d: legacy chose %s but ranking returned nothing", round, want.Name)
 		require.Equalf(t, want.Name, ordered[0].Name, "round %d", round)
 	}
+}
+
+// roomLedger is a readable card with nothing on it, so a test states the room
+// it wants directly instead of building instances to consume it.
+func roomLedger(room int64) podLedger {
+	return podLedger{HBMUsableBytes: room}
+}
+
+func TestFilterCandidatesRefusesACardThatCannotHoldTheModel(t *testing.T) {
+	candidates := []corev1.Pod{namedPod("full"), namedPod("roomy")}
+	ledgers := map[string]podLedger{
+		"full":  roomLedger(35 * gibibyte),
+		"roomy": roomLedger(80 * gibibyte),
+	}
+
+	feasible, refusals := filterCandidates(candidates, map[string]bool{}, ledgers, 60*gibibyte)
+
+	require.Len(t, feasible, 1)
+	assert.Equal(t, "roomy", feasible[0].Name)
+	require.Len(t, refusals, 1)
+	assert.Equal(t, "full", refusals[0].Pod)
+	assert.Equal(t, 35*gibibyte, refusals[0].MaximumRoomBytes)
+}
+
+func TestFilterCandidatesAcceptsAnExactFit(t *testing.T) {
+	// The refusal is strictly "less than", so a card with exactly enough is
+	// placed on rather than turned away by a rounding argument.
+	candidates := []corev1.Pod{namedPod("exact")}
+	ledgers := map[string]podLedger{"exact": roomLedger(60 * gibibyte)}
+
+	feasible, refusals := filterCandidates(candidates, map[string]bool{}, ledgers, 60*gibibyte)
+
+	require.Len(t, feasible, 1)
+	assert.Empty(t, refusals)
+}
+
+// TestFilterCandidatesOnlyRefusesWhatItCanProve covers the caution in this
+// constraint. Each of these cases was admitted before the check existed and
+// has to stay admitted: the check only ever adds refusals.
+func TestFilterCandidatesOnlyRefusesWhatItCanProve(t *testing.T) {
+	cases := []struct {
+		name    string
+		ledger  podLedger
+		reserve int64
+	}{
+		{
+			name:    "a claim that declared no cost is not judged on memory",
+			ledger:  roomLedger(1 * gibibyte),
+			reserve: 0,
+		},
+		{
+			name:    "a pod Kubernetes gave no GPU is not judged on GPU memory",
+			ledger:  podLedger{NoGPU: true},
+			reserve: 600 * gibibyte,
+		},
+		{
+			name:    "a silent sidecar is a different constraint, not this one",
+			ledger:  podLedger{Missing: missingSnapshot},
+			reserve: 600 * gibibyte,
+		},
+		{
+			name:    "a card whose size could not be read is not proof of anything",
+			ledger:  podLedger{Missing: missingCardSize},
+			reserve: 600 * gibibyte,
+		},
+		{
+			name:    "a neighbour that declared nothing leaves the card unjudged",
+			ledger:  podLedger{HBMUsableBytes: 1 * gibibyte, Missing: missingClaimNumbers},
+			reserve: 600 * gibibyte,
+		},
+		{
+			name:    "a pod with no ledger entry at all",
+			reserve: 600 * gibibyte,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			candidates := []corev1.Pod{namedPod("pod")}
+			ledgers := map[string]podLedger{}
+			if tc.name != "a pod with no ledger entry at all" {
+				ledgers["pod"] = tc.ledger
+			}
+
+			feasible, refusals := filterCandidates(candidates, map[string]bool{}, ledgers, tc.reserve)
+
+			assert.Len(t, feasible, 1, "the pod must still be a candidate")
+			assert.Empty(t, refusals)
+		})
+	}
+}
+
+func TestFilterCandidatesReportsAnOvercommittedCard(t *testing.T) {
+	// A card already promised more than it has reports negative room. That is
+	// information, not an error, and it must reach the operator intact.
+	candidates := []corev1.Pod{namedPod("oversold")}
+	ledgers := map[string]podLedger{"oversold": {
+		HBMUsableBytes: 10 * gibibyte,
+		Instances: []ledgerInstance{{
+			Claim:                 types.NamespacedName{Namespace: testNamespace, Name: "big"},
+			MaximumFootprintBytes: 20 * gibibyte,
+			KVFloorBytes:          4 * gibibyte,
+		}},
+	}}
+
+	feasible, refusals := filterCandidates(candidates, map[string]bool{}, ledgers, 1*gibibyte)
+
+	assert.Empty(t, feasible)
+	require.Len(t, refusals, 1)
+	assert.Equal(t, -14*gibibyte, refusals[0].MaximumRoomBytes)
+}
+
+func TestFilterCandidatesStillDropsPodsAlreadyHostingTheModel(t *testing.T) {
+	// Being already host is not a refusal: it asks nothing of an operator, so
+	// it must not appear among the reasons the claim reports.
+	candidates := []corev1.Pod{namedPod("hosting"), namedPod("full")}
+	ledgers := map[string]podLedger{
+		"hosting": roomLedger(80 * gibibyte),
+		"full":    roomLedger(1 * gibibyte),
+	}
+
+	feasible, refusals := filterCandidates(
+		candidates, map[string]bool{"hosting": true}, ledgers, 60*gibibyte)
+
+	assert.Empty(t, feasible)
+	require.Len(t, refusals, 1)
+	assert.Equal(t, "full", refusals[0].Pod)
+}
+
+func TestSummarizeRefusals(t *testing.T) {
+	message := summarizeRefusals([]podRefusal{
+		{Pod: "a", MaximumRoomBytes: 1 * gibibyte},
+		{Pod: "b", MaximumRoomBytes: 35*gibibyte + gibibyte/3},
+		{Pod: "c", MaximumRoomBytes: 20 * gibibyte},
+	}, 60*gibibyte)
+
+	assert.Contains(t, message, "needs 60.0 GiB per GPU")
+	assert.Contains(t, message, "3 candidate pod(s)")
+	assert.Contains(t, message, "at most 35.3 GiB", "the roomiest refusal is the useful one")
+	assert.NotContains(t, message, "20.0 GiB", "listing every pod would grow with the pool")
+}
+
+func TestGibibytes(t *testing.T) {
+	assert.Equal(t, "0.0 GiB", gibibytes(0))
+	assert.Equal(t, "1.0 GiB", gibibytes(gibibyte))
+	assert.Equal(t, "35.3 GiB", gibibytes(37932236800))
+	assert.Equal(t, "-14.0 GiB", gibibytes(-14*gibibyte))
+}
+
+func TestProvablyTooFullExemptsAPodWithNoGPUBeforeSizingItsCard(t *testing.T) {
+	// The exemption is checked before the card is sized, and that ordering
+	// matters even though both paths admit today. A pod with no GPU is exempt
+	// because GPU memory does not apply to it; a card of no known size is
+	// admitted only because nothing was proved. When the second starts being
+	// refused rather than admitted, the first must stay exempt.
+	//
+	// Constructing a ledger the collector would never produce is the only way
+	// to hold the two apart while they still agree.
+	_, tooFull := provablyTooFull(podLedger{NoGPU: true, HBMUsableBytes: 1}, 600*gibibyte)
+	assert.False(t, tooFull, "a pod with no GPU is not judged on GPU memory")
+
+	_, tooFull = provablyTooFull(podLedger{HBMUsableBytes: 1}, 600*gibibyte)
+	assert.True(t, tooFull, "the same card without the exemption is provably too full")
 }

@@ -82,37 +82,6 @@ type uniformLocality struct{}
 
 func (uniformLocality) Cost(model, nodeName string) float64 { return 0 }
 
-// selectPodForActivation picks a warm pod to attach the model to. Among pods not
-// already hosting this model, it chooses the lowest-cost pod, ranked
-// lexicographically by (locality cost, current model load, name): prefer a node
-// where the weights are already hot, then the least-loaded pod for density
-// spread, breaking remaining ties by name for determinism.
-//
-// A nil provider is treated as uniform (load-only), preserving the existing
-// deterministic fallback when runtime observations are unavailable.
-func selectPodForActivation(candidates []corev1.Pod, alreadyOn map[string]bool, load map[string]int, model string, locality LocalityProvider) (*corev1.Pod, error) {
-	return selectPodForActivationWithState(candidates, alreadyOn, load, model, locality, nil)
-}
-
-// selectPodForActivationWithState first prefers a pod that already has the
-// artifact locally, then live GPU/KV observations, and finally the Phase-1
-// locality/load/name rank. Missing runtime state is safe: it simply falls back
-// to the existing deterministic placement behavior.
-func selectPodForActivationWithState(
-	candidates []corev1.Pod,
-	alreadyOn map[string]bool,
-	load map[string]int,
-	model string,
-	locality LocalityProvider,
-	states map[string]PodPlacementState,
-) (*corev1.Pod, error) {
-	ordered := rankCandidates(filterCandidates(candidates, alreadyOn), load, model, locality, states)
-	if len(ordered) == 0 {
-		return nil, fmt.Errorf("no available candidate warm pod for model")
-	}
-	return ordered[0], nil
-}
-
 // Placement asks two different questions about a warm pod, and one comparison
 // cannot answer both. Whether a pod *can* host this model is a hard
 // constraint: failing one takes the pod out of the running entirely. Which of
@@ -130,21 +99,98 @@ func selectPodForActivationWithState(
 // model's parallelism. Those define the candidate set. Everything below
 // decides among candidates.
 
+// podRefusal records a pod the filter turned down, together with the figure
+// the decision was made from, so a claim can say why it is waiting rather than
+// only that it is.
+//
+// It carries no reason field because there is only one refusal to record: a
+// card provably too full. Pods dropped for already hosting this model are not
+// listed, since "the model is already there" asks nothing of an operator and
+// would only dilute the real cause.
+type podRefusal struct {
+	Pod              string
+	MaximumRoomBytes int64
+}
+
 // filterCandidates applies the hard constraints and returns the pods that
 // could host this model, in the order they arrived. Preference is not its job,
 // so it deliberately does not reorder.
-func filterCandidates(candidates []corev1.Pod, alreadyOn map[string]bool) []*corev1.Pod {
+//
+// minimumReserveBytes is what one instance of the model costs on a card. Zero
+// or negative means the claim declared no cost, and the memory constraint then
+// does not apply; spec.perGPU requires both of its fields to be positive, so a
+// declared cost is always above zero.
+func filterCandidates(
+	candidates []corev1.Pod,
+	alreadyOn map[string]bool,
+	ledgers map[string]podLedger,
+	minimumReserveBytes int64,
+) ([]*corev1.Pod, []podRefusal) {
 	feasible := make([]*corev1.Pod, 0, len(candidates))
+	var refusals []podRefusal
 	for i := range candidates {
+		pod := &candidates[i]
 		// A model's instances have to sit on different pods: a second engine
 		// for the same model on the same card would compete with the first for
 		// memory it is already counted as holding.
-		if alreadyOn[candidates[i].Name] {
+		if alreadyOn[pod.Name] {
 			continue
 		}
-		feasible = append(feasible, &candidates[i])
+		if room, tooFull := provablyTooFull(ledgers[pod.Name], minimumReserveBytes); tooFull {
+			refusals = append(refusals, podRefusal{Pod: pod.Name, MaximumRoomBytes: room})
+			continue
+		}
+		feasible = append(feasible, pod)
 	}
-	return feasible
+	return feasible, refusals
+}
+
+// provablyTooFull reports whether this card can be shown to have no room for a
+// model needing minimumReserveBytes, and if so how much it does have.
+//
+// maximumRoomBytes is what the card would offer if every instance on it
+// dropped to the KV floor its claim declared, which needs those engines put to
+// sleep. It is therefore the most room that will ever exist there, and needing
+// more than it cannot be fixed by waiting.
+//
+// It answers false whenever the question cannot be settled, which is the whole
+// of its caution: a pod Kubernetes gave no GPU is not judged on GPU memory, a
+// ledger that could not be read is a different constraint and not this one,
+// and a claim that declared no cost offers nothing to compare against. Each of
+// those admits the pod exactly as it was admitted before this check existed.
+func provablyTooFull(ledger podLedger, minimumReserveBytes int64) (int64, bool) {
+	if minimumReserveBytes <= 0 || ledger.NoGPU {
+		return 0, false
+	}
+	room, known := ledger.MaximumRoomBytes()
+	if !known {
+		return 0, false
+	}
+	return room, room < minimumReserveBytes
+}
+
+// summarizeRefusals states, in one line an operator can act on, how far the
+// pool is from holding this model. It reports the roomiest refused pod rather
+// than listing every one: the gap that matters is the smallest one, and a list
+// would grow with the pool.
+func summarizeRefusals(refusals []podRefusal, minimumReserveBytes int64) string {
+	roomiest := refusals[0].MaximumRoomBytes
+	for _, refusal := range refusals[1:] {
+		if refusal.MaximumRoomBytes > roomiest {
+			roomiest = refusal.MaximumRoomBytes
+		}
+	}
+	return fmt.Sprintf(
+		"no warm pod has room: this model needs %s per GPU, and of %d candidate pod(s) the roomiest could free at most %s",
+		gibibytes(minimumReserveBytes), len(refusals), gibibytes(roomiest),
+	)
+}
+
+// gibibytes renders a byte count for someone reading a status condition.
+// Placement figures are GPU-sized, so GiB to one decimal stays readable while
+// keeping two of them comparable at a glance.
+func gibibytes(bytes int64) string {
+	return fmt.Sprintf("%.1f GiB", float64(bytes)/float64(1<<30))
 }
 
 // rankCandidates orders feasible pods, best first, sorting in place and

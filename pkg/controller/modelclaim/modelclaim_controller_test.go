@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -139,10 +140,22 @@ func (f *fakeRuntime) Snapshot(_ context.Context, podIP string, _ int) (*Runtime
 		return nil, nil
 	}
 	result := &RuntimeSnapshot{}
-	if snapshot, ok := f.snapshots[podIP]; ok {
+	snapshot, stated := f.snapshots[podIP]
+	if stated {
 		copy := *snapshot
 		copy.Models = append([]RuntimeSnapshotModel(nil), snapshot.Models...)
 		result = &copy
+	}
+	// A pod with a card has a runtime that can see it. Without this the ledger
+	// cannot size the card and placement refuses the pod, which would fail
+	// every test here for an unrelated reason. A test that states its own
+	// snapshot gets exactly what it stated, empty accelerator list included.
+	if !stated {
+		result.Accelerators = []RuntimeAcceleratorSnapshot{{
+			ID:            "GPU-test-0",
+			HBMTotalBytes: testHBMTotalBytes,
+			HBMFreeBytes:  testHBMTotalBytes,
+		}}
 	}
 	for _, model := range f.models {
 		present := false
@@ -189,10 +202,28 @@ func warmPod(name, poolName string, enabled bool, phase corev1.PodPhase) *corev1
 	if enabled {
 		labels[constants.ModelPoolLabelEnabled] = constants.ModelPoolLabelEnabledValue
 	}
-	return &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace, Labels: labels},
 		Status:     corev1.PodStatus{Phase: phase, PodIP: "10.0.0.1"},
 	}
+	// A warm GPU pool pod holds a card. Placement reads that from the pod's
+	// resources, and a pod without one falls outside the memory constraint
+	// entirely, which would quietly stop every test here from reaching it.
+	pod.Spec.Containers = []corev1.Container{{
+		Name: "aibrix-runtime",
+		Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+			nvidiaGPUResourceName: *resource.NewQuantity(1, resource.DecimalSI),
+		}},
+	}}
+	return pod
+}
+
+// cpuOnlyWarmPod is the mock and legacy pool: a warm pod Kubernetes gave no
+// GPU. GPU memory accounting does not apply to it.
+func cpuOnlyWarmPod(name, poolName string) *corev1.Pod {
+	pod := warmPod(name, poolName, true, corev1.PodRunning)
+	pod.Spec.Containers = nil
+	return pod
 }
 
 func warmPodWithGPUs(name, poolName string, gpuCount int64) *corev1.Pod {
@@ -218,9 +249,21 @@ func sampleModelClaim() *modelv1alpha1.ModelClaim {
 			EngineConfig: &modelv1alpha1.ModelClaimEngineConfig{
 				Args: map[string]string{"--max-model-len": "2048"},
 			},
+			PerGPU: &modelv1alpha1.ModelClaimPerGPU{
+				MaximumFootprintBytes: ptr.To(testFootprintBytes),
+				KVFloorBytes:          ptr.To(testKVFloorBytes),
+			},
 		},
 	}
 }
+
+// A sample claim is small next to a test card, so tests about something other
+// than capacity are never refused for it. Tests that do care state their own
+// figures.
+const (
+	testFootprintBytes int64 = 4 << 30
+	testKVFloorBytes   int64 = 2 << 30
+)
 
 func newReconciler(t *testing.T, objs ...client.Object) (*ModelClaimReconciler, *fakeRuntime) {
 	t.Helper()
