@@ -34,7 +34,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -249,9 +248,9 @@ func sampleModelClaim() *modelv1alpha1.ModelClaim {
 			EngineConfig: &modelv1alpha1.ModelClaimEngineConfig{
 				Args: map[string]string{"--max-model-len": "2048"},
 			},
-			PerGPU: &modelv1alpha1.ModelClaimPerGPU{
-				MaximumFootprintBytes: ptr.To(testFootprintBytes),
-				KVFloorBytes:          ptr.To(testKVFloorBytes),
+			PerGPU: modelv1alpha1.ModelClaimPerGPU{
+				MaximumFootprintBytes: testFootprintBytes,
+				KVFloorBytes:          testKVFloorBytes,
 			},
 		},
 	}

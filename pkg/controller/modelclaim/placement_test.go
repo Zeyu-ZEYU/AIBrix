@@ -496,11 +496,6 @@ func TestFilterCandidatesOnlyRefusesWhatItCanProve(t *testing.T) {
 		reserve int64
 	}{
 		{
-			name:    "a claim that declared no cost is not judged on memory",
-			ledger:  roomLedger(1 * gibibyte),
-			reserve: 0,
-		},
-		{
 			name:    "a pod Kubernetes gave no GPU is not judged on GPU memory",
 			ledger:  podLedger{State: ledgerNoGPU},
 			reserve: 600 * gibibyte,
@@ -513,11 +508,6 @@ func TestFilterCandidatesOnlyRefusesWhatItCanProve(t *testing.T) {
 		{
 			name:    "a card whose size could not be read is not proof of anything",
 			ledger:  podLedger{State: ledgerNoCardSize},
-			reserve: 600 * gibibyte,
-		},
-		{
-			name:    "a neighbour that declared nothing leaves the card unjudged",
-			ledger:  podLedger{State: ledgerUndeclared, HBMUsableBytes: 1 * gibibyte},
 			reserve: 600 * gibibyte,
 		},
 		{

@@ -399,9 +399,7 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 		return fmt.Errorf("invalid engineConfig parallelism: %w", err)
 	}
 	placementStates := r.collectPlacementStates(ctx, candidates, pm.Spec.ArtifactURL, parallelism)
-	// A claim that declared no cost is placed exactly as it was before this
-	// check existed: there is nothing to compare a card against.
-	minimumReserveBytes, _ := claimMinimumReserveBytes(pm)
+	minimumReserveBytes := claimMinimumReserveBytes(pm)
 	ledgers := r.collectPodLedgers(ctx, pm.Namespace, candidates, placementStates)
 
 	for desiredReplicas(pm) > int32(len(pm.Status.Instances)) {
@@ -462,15 +460,13 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 		load[pod.Name]++
 		// Charge the card now, so a second instance in this same round sees
 		// the space the first one just took rather than counting it twice.
-		if minimumReserveBytes > 0 {
-			ledger := ledgers[pod.Name]
-			ledger.Instances = append(ledger.Instances, ledgerInstance{
-				Claim:                 types.NamespacedName{Namespace: pm.Namespace, Name: pm.Name},
-				MaximumFootprintBytes: *pm.Spec.PerGPU.MaximumFootprintBytes,
-				KVFloorBytes:          *pm.Spec.PerGPU.KVFloorBytes,
-			})
-			ledgers[pod.Name] = ledger
-		}
+		ledger := ledgers[pod.Name]
+		ledger.Instances = append(ledger.Instances, ledgerInstance{
+			Claim:                 types.NamespacedName{Namespace: pm.Namespace, Name: pm.Name},
+			MaximumFootprintBytes: pm.Spec.PerGPU.MaximumFootprintBytes,
+			KVFloorBytes:          pm.Spec.PerGPU.KVFloorBytes,
+		})
+		ledgers[pod.Name] = ledger
 		r.Recorder.Eventf(pm, corev1.EventTypeNormal, "Activating",
 			"model %s engine starting on pod %s:%d", servedModelName(pm), pod.Name, resp.Port)
 	}

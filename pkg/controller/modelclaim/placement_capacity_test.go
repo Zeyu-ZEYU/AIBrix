@@ -35,9 +35,9 @@ func bigClaim(name string) *modelv1alpha1.ModelClaim {
 	claim := sampleModelClaim()
 	claim.Name = name
 	claim.Spec.ModelName = ptr.To(name)
-	claim.Spec.PerGPU = &modelv1alpha1.ModelClaimPerGPU{
-		MaximumFootprintBytes: ptr.To(40 * gibibyte),
-		KVFloorBytes:          ptr.To(4 * gibibyte),
+	claim.Spec.PerGPU = modelv1alpha1.ModelClaimPerGPU{
+		MaximumFootprintBytes: 40 * gibibyte,
+		KVFloorBytes:          4 * gibibyte,
 	}
 	return withFinalizer(claim)
 }
@@ -125,26 +125,9 @@ func TestPlacementDistinguishesNoRoomFromNoPods(t *testing.T) {
 		"a claim that matched nothing is not a capacity problem")
 }
 
-// TestPlacementIgnoresMemoryForAClaimThatDeclaredNone pins the promise this
-// change makes: it only ever adds refusals. A claim from before spec.perGPU
-// existed is placed exactly as it was.
-func TestPlacementIgnoresMemoryForAClaimThatDeclaredNone(t *testing.T) {
-	silent := withFinalizer(sampleModelClaim())
-	silent.Spec.PerGPU = nil
-	resident := ledgerClaim("resident", "warm-1", 90*gibibyte, 4*gibibyte)
-	warm1 := warmPod("warm-1", "b300-pool-a", true, corev1.PodRunning)
-	r, runtime := newReconciler(t, silent, resident, warm1)
-
-	reconcileOnce(t, r, silent.Name)
-
-	placed := getModel(t, r, silent.Name)
-	require.Len(t, placed.Status.Instances, 1,
-		"a claim with nothing declared is placed on a card the ledger calls full")
-	assert.Len(t, runtime.activateCalls, 1)
-}
-
-// TestPlacementIgnoresMemoryOnACardFreePod is the other half of that promise,
-// for the mock and CPU-only pools the e2e suite deploys.
+// TestPlacementIgnoresMemoryOnACardFreePod pins the one admission this check
+// still makes on purpose, for the mock and CPU-only pools the e2e suite
+// deploys: a pod with no GPU is not judged on GPU memory.
 func TestPlacementIgnoresMemoryOnACardFreePod(t *testing.T) {
 	claim := bigClaim("huge")
 	pool := cpuOnlyWarmPod("warm-1", "b300-pool-a")

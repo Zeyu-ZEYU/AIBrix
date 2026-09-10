@@ -74,6 +74,9 @@ spec:
                     format: int64
                     minimum: 1
                     type: integer
+                required:
+                - kvFloorBytes
+                - maximumFootprintBytes
                 type: object
               podSelector:
                 properties:
@@ -109,6 +112,7 @@ spec:
                 type: integer
             required:
             - artifactURL
+            - perGPU
             - podSelector
             type: object
           status:

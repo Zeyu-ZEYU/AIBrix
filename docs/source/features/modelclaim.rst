@@ -247,14 +247,14 @@ The supported spec fields are:
      - Engine CLI flags mapped to string values. Use an empty string for a
        boolean flag.
    * - ``perGPU.maximumFootprintBytes``
-     - No
+     - Yes
      - The largest non-KV GPU memory one instance holds on a single device:
        weights, captured CUDA graphs, activation workspaces and allocator
-       retention.
+       retention. Must be positive.
    * - ``perGPU.kvFloorBytes``
-     - No
+     - Yes
      - The KV cache one instance needs on a single device to serve at all,
-       enough for one request of ``max_model_len``.
+       enough for one request of ``max_model_len``. Must be positive.
 
 For example:
 
@@ -296,6 +296,10 @@ less is not.
 The KV floor is the KV cache an instance needs to serve one request of
 ``max_model_len``. An engine's KV limit can be lowered towards that floor but
 never past it, so the memory is held for as long as the engine is awake.
+
+Both fields are required and are rejected by the API server unless positive, so
+a ModelClaim without them is never created. The control plane does not check
+again: a claim that reaches a controller always carries both numbers.
 
 Configure TP and PP pools
 -------------------------

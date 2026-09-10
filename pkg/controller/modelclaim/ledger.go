@@ -55,6 +55,13 @@ import (
 // will eventually have to say its own figure.
 const defaultDriverReserveBytes int64 = 256 << 20
 
+// hbmUsableUnknown is what HBMUsableBytes holds whenever the ledger cannot say
+// how large the card is. It is negative rather than zero because zero is a
+// number arithmetic accepts: a reader who skipped the state check would
+// compute a plausible-looking card from zero, and an obviously broken one from
+// this. Only ledgerComplete carries a real size.
+const hbmUsableUnknown int64 = -1
+
 // ledgerState says whether a ledger can answer how much room its card has,
 // and when it cannot, why. The five values are mutually exclusive, so a ledger
 // is in exactly one of them and no combination has to be reasoned about.
@@ -81,10 +88,6 @@ const (
 	// usable size for them: it saw no accelerator at all, or not as many as
 	// this model's parallelism spans.
 	ledgerNoCardSize
-	// ledgerUndeclared means an instance already on this card belongs to a
-	// ModelClaim that never declared spec.perGPU, so its share cannot be
-	// counted and the total is unknowable.
-	ledgerUndeclared
 )
 
 // String is the phrase an operator reads, so each value says what is wrong
@@ -97,8 +100,6 @@ func (s ledgerState) String() string {
 		return "the pod holds no GPU"
 	case ledgerNoCardSize:
 		return "the runtime reported no usable size for this pod's GPUs"
-	case ledgerUndeclared:
-		return "an instance on this pod has no declared spec.perGPU"
 	default:
 		return "no readable account for this pod"
 	}
@@ -121,14 +122,11 @@ type ledgerInstance struct {
 // every instance on such a pod occupies all of its cards, so the cards differ
 // only in size.
 type podLedger struct {
-	State          ledgerState
+	State ledgerState
+	// HBMUsableBytes is the card's size, and is hbmUsableUnknown unless State
+	// is ledgerComplete.
 	HBMUsableBytes int64
 	Instances      []ledgerInstance
-	// UndeclaredClaim names the claim that put the hole in this account, so an
-	// operator is told which ModelClaim to fix rather than only that one
-	// exists. Set only with ledgerUndeclared. Go cannot attach a payload to an
-	// enum value, so this is the one field whose meaning depends on State.
-	UndeclaredClaim types.NamespacedName
 }
 
 // chargeable reports whether an instance can still be added to this pod's
@@ -166,16 +164,10 @@ func (l podLedger) MaximumRoomBytes() (int64, bool) {
 // It describes one instance on one card. A claim with several instances spends
 // this much on each card it lands on.
 //
-// The second return is false when the claim did not declare both numbers.
-func claimMinimumReserveBytes(pm *modelv1alpha1.ModelClaim) (int64, bool) {
-	if pm == nil || pm.Spec.PerGPU == nil {
-		return 0, false
-	}
-	footprint, floor := pm.Spec.PerGPU.MaximumFootprintBytes, pm.Spec.PerGPU.KVFloorBytes
-	if footprint == nil || floor == nil || *footprint <= 0 || *floor <= 0 {
-		return 0, false
-	}
-	return *footprint + *floor, true
+// Both numbers are required by the CRD and validated as positive, so this does
+// not check for them. The API server is the only place that check belongs.
+func claimMinimumReserveBytes(pm *modelv1alpha1.ModelClaim) int64 {
+	return pm.Spec.PerGPU.MaximumFootprintBytes + pm.Spec.PerGPU.KVFloorBytes
 }
 
 // hbmUsableBytes is how much of a pod's GPU memory can ever hold an engine.
@@ -227,11 +219,11 @@ func (r *ModelClaimReconciler) collectPodLedgers(
 		state, found := states[pod.Name]
 		switch {
 		case podGPUCount(*pod) == 0:
-			ledgers[pod.Name] = podLedger{State: ledgerNoGPU}
+			ledgers[pod.Name] = podLedger{State: ledgerNoGPU, HBMUsableBytes: hbmUsableUnknown}
 		case !found:
-			ledgers[pod.Name] = podLedger{State: ledgerUnread}
+			ledgers[pod.Name] = podLedger{State: ledgerUnread, HBMUsableBytes: hbmUsableUnknown}
 		case !state.HBMUsableKnown:
-			ledgers[pod.Name] = podLedger{State: ledgerNoCardSize}
+			ledgers[pod.Name] = podLedger{State: ledgerNoCardSize, HBMUsableBytes: hbmUsableUnknown}
 		default:
 			ledgers[pod.Name] = podLedger{
 				State:          ledgerComplete,
@@ -245,16 +237,14 @@ func (r *ModelClaimReconciler) collectPodLedgers(
 		// Without the claim list every ledger would understate what its card
 		// already owes, which is the one direction that overcommits a GPU.
 		klog.ErrorS(err, "collect pod ledgers: list model claims", "namespace", namespace)
-		for name, ledger := range ledgers {
-			ledger.State = ledgerUnread
-			ledgers[name] = ledger
+		for name := range ledgers {
+			ledgers[name] = podLedger{State: ledgerUnread, HBMUsableBytes: hbmUsableUnknown}
 		}
 		return ledgers
 	}
 
 	for i := range list.Items {
 		claim := &list.Items[i]
-		_, declared := claimMinimumReserveBytes(claim)
 		key := types.NamespacedName{Namespace: claim.Namespace, Name: claim.Name}
 		for _, instance := range claim.Status.Instances {
 			// A failed instance has exhausted its restarts and its engine
@@ -271,16 +261,10 @@ func (r *ModelClaimReconciler) collectPodLedgers(
 			if !tracked || !ledger.chargeable() {
 				continue
 			}
-			if !declared {
-				ledger.State = ledgerUndeclared
-				ledger.UndeclaredClaim = key
-				ledgers[instance.Pod] = ledger
-				continue
-			}
 			ledger.Instances = append(ledger.Instances, ledgerInstance{
 				Claim:                 key,
-				MaximumFootprintBytes: *claim.Spec.PerGPU.MaximumFootprintBytes,
-				KVFloorBytes:          *claim.Spec.PerGPU.KVFloorBytes,
+				MaximumFootprintBytes: claim.Spec.PerGPU.MaximumFootprintBytes,
+				KVFloorBytes:          claim.Spec.PerGPU.KVFloorBytes,
 			})
 			ledgers[instance.Pod] = ledger
 		}

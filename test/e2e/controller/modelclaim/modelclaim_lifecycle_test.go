@@ -250,9 +250,9 @@ func createLifecycleClaim(
 				// The pool this suite deploys requests no GPU, so the
 				// memory constraint does not apply to it. Declaring a cost
 				// anyway keeps the fixture shaped like a real claim.
-				PerGPU: &modelv1alpha1.ModelClaimPerGPU{
-					MaximumFootprintBytes: ptr.To(int64(1 << 30)),
-					KVFloorBytes:          ptr.To(int64(1 << 30)),
+				PerGPU: modelv1alpha1.ModelClaimPerGPU{
+					MaximumFootprintBytes: 1 << 30,
+					KVFloorBytes:          1 << 30,
 				},
 			},
 		},

@@ -116,10 +116,9 @@ type podRefusal struct {
 // could host this model, in the order they arrived. Preference is not its job,
 // so it deliberately does not reorder.
 //
-// minimumReserveBytes is what one instance of the model costs on a card. Zero
-// or negative means the claim declared no cost, and the memory constraint then
-// does not apply; spec.perGPU requires both of its fields to be positive, so a
-// declared cost is always above zero.
+// minimumReserveBytes is what one instance of the model costs on a card, and
+// is always positive: spec.perGPU is required and both of its fields are
+// validated above zero, so a claim that reached a controller has them.
 func filterCandidates(
 	candidates []corev1.Pod,
 	alreadyOn map[string]bool,
@@ -154,12 +153,11 @@ func filterCandidates(
 // more than it cannot be fixed by waiting.
 //
 // It answers false whenever the question cannot be settled, which is the whole
-// of its caution: a pod Kubernetes gave no GPU is not judged on GPU memory, a
-// ledger that could not be read is a different constraint and not this one,
-// and a claim that declared no cost offers nothing to compare against. Each of
-// those admits the pod exactly as it was admitted before this check existed.
+// of its caution: a pod Kubernetes gave no GPU is not judged on GPU memory,
+// and a ledger that could not be read is a different constraint, not this one.
+// Both admit the pod exactly as it was admitted before this check existed.
 func provablyTooFull(ledger podLedger, minimumReserveBytes int64) (int64, bool) {
-	if minimumReserveBytes <= 0 || ledger.State == ledgerNoGPU {
+	if ledger.State == ledgerNoGPU {
 		return 0, false
 	}
 	room, known := ledger.MaximumRoomBytes()
