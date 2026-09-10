@@ -1,0 +1,65 @@
+# Three ModelClaims sized so that two of them fill a two-GPU pool and the third
+# has nowhere to go. See README.md for how the numbers were chosen.
+#
+# The declared cost is deliberately far above what this model really uses. The
+# gate judges the declaration, so overstating it produces a full pool on demand,
+# while the engines themselves stay small enough to start and serve normally.
+apiVersion: model.aibrix.ai/v1alpha1
+kind: ModelClaim
+metadata:
+  name: gate-a
+  namespace: zeyu-dev
+spec:
+  modelName: gate-a
+  podSelector:
+    matchLabels:
+      pool.aibrix.ai/name: zeyu-pool-a
+  artifactURL: /models/DeepSeek-R1-Distill-Qwen-1.5B
+  engine: vllm
+  replicas: 1
+  perGPU:
+    maximumFootprintBytes: 53687091200  # 50 GiB
+    kvFloorBytes: 10737418240           # 10 GiB
+  engineConfig:
+    args:
+      --max-model-len: "2048"
+---
+apiVersion: model.aibrix.ai/v1alpha1
+kind: ModelClaim
+metadata:
+  name: gate-b
+  namespace: zeyu-dev
+spec:
+  modelName: gate-b
+  podSelector:
+    matchLabels:
+      pool.aibrix.ai/name: zeyu-pool-a
+  artifactURL: /models/DeepSeek-R1-Distill-Qwen-1.5B
+  engine: vllm
+  replicas: 1
+  perGPU:
+    maximumFootprintBytes: 53687091200  # 50 GiB
+    kvFloorBytes: 10737418240           # 10 GiB
+  engineConfig:
+    args:
+      --max-model-len: "2048"
+---
+apiVersion: model.aibrix.ai/v1alpha1
+kind: ModelClaim
+metadata:
+  name: gate-c
+  namespace: zeyu-dev
+spec:
+  modelName: gate-c
+  podSelector:
+    matchLabels:
+      pool.aibrix.ai/name: zeyu-pool-a
+  artifactURL: /models/DeepSeek-R1-Distill-Qwen-1.5B
+  engine: vllm
+  replicas: 1
+  perGPU:
+    maximumFootprintBytes: 53687091200  # 50 GiB
+    kvFloorBytes: 10737418240           # 10 GiB
+  engineConfig:
+    args:
+      --max-model-len: "2048"
