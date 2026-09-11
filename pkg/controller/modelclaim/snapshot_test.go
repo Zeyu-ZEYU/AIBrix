@@ -104,3 +104,17 @@ func TestPlacementStateFromSnapshot(t *testing.T) {
 	assert.Equal(t, int64(35), groupState.KVUsedBytes)
 	assert.Equal(t, 2, groupState.ModelCount)
 }
+
+func TestPlacementStateFromSnapshotSkipsEnginesWithoutASegment(t *testing.T) {
+	snapshot := &RuntimeSnapshot{
+		Models: []RuntimeSnapshotModel{
+			{ModelName: "serving", KVUsedBytes: 10, KVCapacityBytes: 100},
+			{ModelName: "starting", KVUsedBytes: -1, KVCapacityBytes: -1},
+		},
+	}
+
+	state := placementStateFromSnapshot(snapshot, "", 1)
+
+	assert.Equal(t, int64(10), state.KVUsedBytes)
+	assert.Equal(t, 2, state.ModelCount)
+}

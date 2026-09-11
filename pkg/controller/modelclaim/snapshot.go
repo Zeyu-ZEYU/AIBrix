@@ -135,6 +135,11 @@ func placementStateFromSnapshot(snapshot *RuntimeSnapshot, artifactURL string, p
 	}
 	state.HBMUsableBytes, state.HBMUsableKnown = hbmUsableBytes(snapshot)
 	for _, model := range snapshot.Models {
+		// An engine whose segment does not exist yet reports a negative figure.
+		// It has built no KV cache, so it adds nothing here.
+		if model.KVUsedBytes < 0 {
+			continue
+		}
 		state.KVUsedBytes += model.KVUsedBytes
 	}
 	return state

@@ -248,6 +248,9 @@ class RuntimeSnapshotModel(NoProtectedBaseModel):
     restart_count: int = 0
     last_error: Optional[str] = None
     last_transition: Optional[datetime] = None
+    # Both KV figures come from the engine's kvcached segment: the pages it has
+    # mapped, used and preallocated together, and the limit written there. Both
+    # are -1 while the segment does not exist.
     kv_used_bytes: int
     kv_capacity_bytes: int
     # Largest amount of GPU memory attributable to this engine on any visible

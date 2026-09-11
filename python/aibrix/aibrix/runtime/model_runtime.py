@@ -623,6 +623,14 @@ def instance_ready(inst: "ModelInstance") -> bool:
     return engine_ready(inst.port)
 
 
+# KV_UNKNOWN is reported for both KV figures of an engine whose kvcached
+# segment does not exist. Every real engine is in that state until it builds
+# its KV cache, and a mock engine never leaves it. It is negative rather than
+# zero because zero is a reading the control plane acts on: a limit of zero,
+# or an engine holding nothing, when in fact neither is known.
+KV_UNKNOWN = -1
+
+
 def read_kv_segment(ipc_name: str, shm_dir: str = "/dev/shm"):
     """Read a model's kvcached MemInfoStruct: 3 little-endian int64s
     (total_size, used_size, prealloc_size) at the start of /dev/shm/<ipc_name>
@@ -1583,7 +1591,11 @@ class ModelRuntime:
         models = []
         for inst in instances:
             segment = read_kv_segment(inst.ipc_name)
-            total, used, prealloc = segment if segment else (0, 0, 0)
+            if segment is None:
+                kv_used = kv_capacity = KV_UNKNOWN
+            else:
+                total, used, prealloc = segment
+                kv_used, kv_capacity = used + prealloc, total
             alive = self._instance_alive(inst)
             activity = (
                 engine_request_activity(inst) if alive else EngineRequestActivity()
@@ -1601,8 +1613,8 @@ class ModelRuntime:
                     "restart_count": inst.restart_count,
                     "last_error": inst.last_error,
                     "last_transition": inst.last_transition,
-                    "kv_used_bytes": used + prealloc,
-                    "kv_capacity_bytes": total,
+                    "kv_used_bytes": kv_used,
+                    "kv_capacity_bytes": kv_capacity,
                     "hbm_peak_bytes": engine_hbm_peak_bytes(inst, process_hbm),
                     "request_metrics_observed": activity.observed,
                     "requests_running": activity.requests_running,

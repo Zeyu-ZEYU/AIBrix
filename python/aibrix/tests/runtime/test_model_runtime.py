@@ -761,6 +761,27 @@ def test_snapshot_reports_runtime_state(monkeypatch, tmp_path):
     assert snapshot["observed_at"]
 
 
+def test_snapshot_reports_unknown_kv_before_the_segment_exists(monkeypatch, tmp_path):
+    import aibrix.runtime.model_runtime as runtime_module
+
+    monkeypatch.setenv("AIBRIX_WEIGHT_CACHE_DIR", str(tmp_path))
+    agent = make_agent()
+    agent.activate(model_name="qwen", artifact_url="hf://Qwen/Qwen3-0.6B")
+    monkeypatch.setattr(runtime_module, "gpu_memory_observation", lambda: ([], {}))
+    monkeypatch.setattr(runtime_module, "read_kv_segment", lambda ipc_name: None)
+    monkeypatch.setattr(
+        runtime_module,
+        "engine_request_activity",
+        lambda inst: runtime_module.EngineRequestActivity(),
+    )
+
+    observed = agent.snapshot()["models"][0]
+
+    # Zero would read as an engine holding nothing under a limit of nothing.
+    assert observed["kv_used_bytes"] == runtime_module.KV_UNKNOWN
+    assert observed["kv_capacity_bytes"] == runtime_module.KV_UNKNOWN
+
+
 def test_snapshot_reports_hbm_peak_for_engine_process_tree(monkeypatch):
     import aibrix.runtime.model_runtime as runtime_module
 
