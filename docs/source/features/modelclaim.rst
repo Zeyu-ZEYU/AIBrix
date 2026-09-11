@@ -370,6 +370,12 @@ ModelClaim status summarizes the lifecycle:
    * - ``Failed``
      - Activation or local restart recovery reached a terminal failure.
 
+Each entry in ``status.instances`` names the Pod, the engine port and the
+phase, and records ``kvLimitBytes``: the KV cache limit intended for that
+engine, set to the claim's ``perGPU.kvFloorBytes`` when the instance is
+placed. The limit the engine actually runs under is the KV capacity in the
+runtime snapshot, described below.
+
 Inspect claim status and the routing annotation:
 
 .. code-block:: bash

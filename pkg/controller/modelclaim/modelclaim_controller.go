@@ -451,10 +451,14 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 		// one: an instance recorded whose engine never started.
 		// reconcileInstanceHealth sees no such engine in the pod's snapshot and
 		// clears it.
+		//
+		// The instance is recorded at its KV floor, the least it needs to
+		// serve at all. Nothing in this controller raises it.
 		pm.Status.Instances = append(pm.Status.Instances, modelv1alpha1.ModelClaimInstance{
-			Pod:   pod.Name,
-			Port:  0,
-			Phase: modelv1alpha1.ModelClaimActivating,
+			Pod:          pod.Name,
+			Port:         0,
+			Phase:        modelv1alpha1.ModelClaimActivating,
+			KVLimitBytes: pm.Spec.PerGPU.KVFloorBytes,
 		})
 		if err := r.Status().Update(ctx, pm); err != nil {
 			return fmt.Errorf("reserve %s on %s: %w", servedModelName(pm), pod.Name, err)

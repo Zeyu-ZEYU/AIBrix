@@ -200,6 +200,8 @@ func TestPlacementRecordsTheInstanceBeforeStartingTheEngine(t *testing.T) {
 	assert.Equal(t, modelv1alpha1.ModelClaimActivating, recordedWhenEngineStarted[0].Phase)
 	assert.Equal(t, int32(0), recordedWhenEngineStarted[0].Port,
 		"the port is not known yet, and zero keeps the model unroutable")
+	assert.Equal(t, claim.Spec.PerGPU.KVFloorBytes, recordedWhenEngineStarted[0].KVLimitBytes,
+		"the instance is recorded at its KV floor, before the engine starts")
 
 	placed := getModel(t, r, "early").Status.Instances
 	require.Len(t, placed, 1)
