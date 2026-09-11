@@ -463,3 +463,225 @@ func TestCollectPodLedgersKeepsTheSizeSentinelInvariant(t *testing.T) {
 		assert.Equalf(t, hbmUsableUnknown, ledger.HBMUsableBytes, "pod %s", name)
 	}
 }
+
+func TestKVUpperBoundBytes(t *testing.T) {
+	serving := func(capacity, used int64) *RuntimeSnapshotModel {
+		return &RuntimeSnapshotModel{
+			Phase: runtimePhaseActive, Alive: true, Ready: true,
+			KVCapacityBytes: capacity, KVUsedBytes: used,
+		}
+	}
+	cases := []struct {
+		name   string
+		limit  int64
+		engine *RuntimeSnapshotModel
+		want   int64
+	}{
+		{
+			name:  "at rest, the segment holds the recorded limit",
+			limit: 10 * gibibyte, engine: serving(10*gibibyte, gibibyte), want: 10 * gibibyte,
+		},
+		{
+			name:  "an engine still under kvcached's default can grow that far",
+			limit: 10 * gibibyte, engine: serving(80*gibibyte, gibibyte), want: 80 * gibibyte,
+		},
+		{
+			name:  "a lowered limit does not take back pages already mapped",
+			limit: 12 * gibibyte, engine: serving(12*gibibyte, 20*gibibyte), want: 20 * gibibyte,
+		},
+		{
+			name:  "a raised limit counts before the engine has it",
+			limit: 30 * gibibyte, engine: serving(10*gibibyte, gibibyte), want: 30 * gibibyte,
+		},
+		{
+			name:  "a sleeping engine keeps its segment, so it is read",
+			limit: 10 * gibibyte,
+			engine: &RuntimeSnapshotModel{
+				Phase: runtimePhaseSleeping, Alive: true,
+				KVCapacityBytes: 10 * gibibyte, KVUsedBytes: gibibyte,
+			},
+			want: 10 * gibibyte,
+		},
+		{name: "no engine in the snapshot", limit: 10 * gibibyte, want: kvUpperBoundUnknown},
+		{
+			name:  "a booting engine may not have built its segment",
+			limit: 10 * gibibyte,
+			engine: &RuntimeSnapshotModel{
+				Phase: "booting", Alive: true, KVCapacityBytes: 80 * gibibyte,
+			},
+			want: kvUpperBoundUnknown,
+		},
+		{
+			name:  "a restarting engine may show its previous process's segment",
+			limit: 10 * gibibyte,
+			engine: &RuntimeSnapshotModel{
+				Phase: "restarting", KVCapacityBytes: 10 * gibibyte,
+			},
+			want: kvUpperBoundUnknown,
+		},
+		{
+			name:  "a sleeping engine whose process has died",
+			limit: 10 * gibibyte,
+			engine: &RuntimeSnapshotModel{
+				Phase: runtimePhaseSleeping, KVCapacityBytes: 10 * gibibyte,
+			},
+			want: kvUpperBoundUnknown,
+		},
+		{
+			name:  "a ready engine without a segment",
+			limit: 10 * gibibyte, engine: serving(-1, -1), want: kvUpperBoundUnknown,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, kvUpperBoundBytes(tc.limit, tc.engine))
+		})
+	}
+}
+
+func TestMinimumRoomBytes(t *testing.T) {
+	line := func(footprint, upperBound int64) ledgerInstance {
+		return ledgerInstance{
+			MaximumFootprintBytes: footprint,
+			KVFloorBytes:          4 * gibibyte,
+			KVLimitBytes:          4 * gibibyte,
+			KVUpperBoundBytes:     upperBound,
+		}
+	}
+	cases := []struct {
+		name      string
+		ledger    podLedger
+		want      int64
+		wantKnown bool
+	}{
+		{
+			name:      "an empty card is sure of all of itself",
+			ledger:    podLedger{State: ledgerComplete, HBMUsableBytes: 80 * gibibyte},
+			want:      80 * gibibyte,
+			wantKnown: true,
+		},
+		{
+			name: "each instance costs its footprint plus its KV upper bound",
+			ledger: podLedger{
+				State:          ledgerComplete,
+				HBMUsableBytes: 80 * gibibyte,
+				Instances:      []ledgerInstance{line(20*gibibyte, 4*gibibyte), line(10*gibibyte, 6*gibibyte)},
+			},
+			want:      40 * gibibyte,
+			wantKnown: true,
+		},
+		{
+			name: "an engine under kvcached's default leaves the card overcommitted",
+			ledger: podLedger{
+				State:          ledgerComplete,
+				HBMUsableBytes: 80 * gibibyte,
+				Instances:      []ledgerInstance{line(20*gibibyte, 70*gibibyte)},
+			},
+			want:      -10 * gibibyte,
+			wantKnown: true,
+		},
+		{
+			name: "one unread engine leaves the answer unknown",
+			ledger: podLedger{
+				State:          ledgerComplete,
+				HBMUsableBytes: 80 * gibibyte,
+				Instances:      []ledgerInstance{line(20*gibibyte, 4*gibibyte), line(10*gibibyte, kvUpperBoundUnknown)},
+			},
+		},
+		{
+			name: "so does an engine the account does not include",
+			ledger: podLedger{
+				State:              ledgerComplete,
+				HBMUsableBytes:     80 * gibibyte,
+				UnaccountedEngines: []string{"stray"},
+			},
+		},
+		{name: "the zero value knows nothing", ledger: podLedger{}},
+		{name: "a pod with no GPU has no answer", ledger: podLedger{State: ledgerNoGPU}},
+		{name: "no usable card size means no answer", ledger: podLedger{State: ledgerGPUMeasureFailed}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, known := tc.ledger.MinimumRoomBytes()
+			assert.Equal(t, tc.wantKnown, known)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// engineOf is the engine a runtime reports for a claim: serving, and tied to
+// the claim by its UID.
+func engineOf(claim *modelv1alpha1.ModelClaim, capacity, used int64) RuntimeSnapshotModel {
+	return RuntimeSnapshotModel{
+		ModelName: servedModelName(claim),
+		ClaimRef:  &ModelClaimRef{Namespace: claim.Namespace, Name: claim.Name, UID: string(claim.UID)},
+		Phase:     runtimePhaseActive, Alive: true, Ready: true,
+		KVCapacityBytes: capacity, KVUsedBytes: used,
+	}
+}
+
+func TestCollectPodLedgersReadsEachEngine(t *testing.T) {
+	t.Run("an instance's KV upper bound is read from its engine", func(t *testing.T) {
+		resident := ledgerClaim("resident", "warm-1", 20*gibibyte, 4*gibibyte)
+		resident.UID = "resident-uid"
+		resident.Status.Instances[0].KVLimitBytes = 4 * gibibyte
+		r, runtime := newReconciler(t, resident)
+		candidates := gpuPods(runtime, "warm-1")
+		runtime.snapshots[candidates[0].Status.PodIP].Models = []RuntimeSnapshotModel{
+			engineOf(resident, 30*gibibyte, gibibyte),
+		}
+		ledgers := collectLedgers(t, r, candidates)
+
+		require.Len(t, ledgers["warm-1"].Instances, 1)
+		assert.Equal(t, 4*gibibyte, ledgers["warm-1"].Instances[0].KVLimitBytes)
+		assert.Equal(t, 30*gibibyte, ledgers["warm-1"].Instances[0].KVUpperBoundBytes,
+			"the segment still allows 30 GiB, whatever the instance records")
+		room, known := ledgers["warm-1"].MinimumRoomBytes()
+		require.True(t, known)
+		assert.Equal(t, testUsableBytes-50*gibibyte, room)
+		maximum, _ := ledgers["warm-1"].MaximumRoomBytes()
+		assert.Equal(t, testUsableBytes-24*gibibyte, maximum, "maximum room reads no engine")
+	})
+
+	t.Run("an instance whose engine is not in the snapshot has no bound", func(t *testing.T) {
+		starting := ledgerClaim("starting", "warm-1", 20*gibibyte, 4*gibibyte)
+		starting.Status.Instances[0].Phase = modelv1alpha1.ModelClaimActivating
+		r, runtime := newReconciler(t, starting)
+		ledgers := collectLedgers(t, r, gpuPods(runtime, "warm-1"))
+
+		require.Len(t, ledgers["warm-1"].Instances, 1)
+		assert.Equal(t, kvUpperBoundUnknown, ledgers["warm-1"].Instances[0].KVUpperBoundBytes)
+		_, known := ledgers["warm-1"].MinimumRoomBytes()
+		assert.False(t, known)
+		_, known = ledgers["warm-1"].MaximumRoomBytes()
+		assert.True(t, known, "the declared figures still bound the card")
+	})
+
+	t.Run("an engine no instance claims is named, and leaves the minimum unknown", func(t *testing.T) {
+		r, runtime := newReconciler(t)
+		candidates := gpuPods(runtime, "warm-1")
+		runtime.snapshots[candidates[0].Status.PodIP].Models = []RuntimeSnapshotModel{{
+			ModelName: "leftover", Phase: "stopping", Alive: true,
+			KVCapacityBytes: 30 * gibibyte, KVUsedBytes: 5 * gibibyte,
+		}}
+		ledgers := collectLedgers(t, r, candidates)
+
+		assert.Equal(t, []string{"leftover"}, ledgers["warm-1"].UnaccountedEngines)
+		_, known := ledgers["warm-1"].MinimumRoomBytes()
+		assert.False(t, known)
+	})
+
+	t.Run("an engine whose process is gone holds nothing and is not named", func(t *testing.T) {
+		r, runtime := newReconciler(t)
+		candidates := gpuPods(runtime, "warm-1")
+		runtime.snapshots[candidates[0].Status.PodIP].Models = []RuntimeSnapshotModel{{
+			ModelName: "exited", Phase: "failed", Alive: false,
+		}}
+		ledgers := collectLedgers(t, r, candidates)
+
+		assert.Empty(t, ledgers["warm-1"].UnaccountedEngines)
+		room, known := ledgers["warm-1"].MinimumRoomBytes()
+		require.True(t, known)
+		assert.Equal(t, testUsableBytes, room)
+	})
+}

@@ -107,10 +107,17 @@ type PodPlacementState struct {
 	// "the snapshot did not say".
 	HBMUsableBytes int64
 	HBMUsableKnown bool
+	// Engines are the engines the snapshot reported, as it reported them. The
+	// ledger reads each one's KV figures from here.
+	Engines []RuntimeSnapshotModel
 }
 
 func placementStateFromSnapshot(snapshot *RuntimeSnapshot, artifactURL string, parallelism int64) PodPlacementState {
-	state := PodPlacementState{SnapshotKnown: true, ModelCount: len(snapshot.Models)}
+	state := PodPlacementState{
+		SnapshotKnown: true,
+		ModelCount:    len(snapshot.Models),
+		Engines:       snapshot.Models,
+	}
 	for _, cached := range snapshot.CachedArtifacts {
 		if cached == artifactURL {
 			state.ArtifactCached = true

@@ -507,6 +507,10 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 			Claim:                 types.NamespacedName{Namespace: pm.Namespace, Name: pm.Name},
 			MaximumFootprintBytes: pm.Spec.PerGPU.MaximumFootprintBytes,
 			KVFloorBytes:          pm.Spec.PerGPU.KVFloorBytes,
+			KVLimitBytes:          pm.Status.Instances[len(pm.Status.Instances)-1].KVLimitBytes,
+			// The engine was only just asked to start, so there is nothing of
+			// it to read yet.
+			KVUpperBoundBytes: kvUpperBoundUnknown,
 		})
 		ledgers[pod.Name] = ledger
 		r.Recorder.Eventf(pm, corev1.EventTypeNormal, "Activating",
