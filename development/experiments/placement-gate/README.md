@@ -185,16 +185,24 @@ that, about 10 seconds later, and goes through `KVLimitSet` to Active.
 
 The pool's gateway serves another team's PD deployment and cannot route to
 these pods, so a request goes to an engine through the API server's pod
-proxy instead. It is a POST to our own pod, so ask before running it.
+proxy instead. It sends one completion request to one of our own engines.
+
+`kubectl create --raw` cannot send it. It posts the body with no
+`Content-Type`, and vLLM refuses such a request with 400. `kubectl proxy`
+passes the header through the same pod proxy:
 
 ```bash
 PORT=$(kubectl get modelclaim gate-b -n zeyu-dev -o json \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"]["instances"][0]["port"])')
-echo '{"model":"gate-b","prompt":"hello","max_tokens":16}' > /tmp/gate-b-request.json
-kubectl create --raw \
-  "/api/v1/namespaces/zeyu-dev/pods/<pod>:$PORT/proxy/v1/completions" \
-  -f /tmp/gate-b-request.json
+kubectl proxy --port=8001 &
+PROXY=$!
+curl -s "http://127.0.0.1:8001/api/v1/namespaces/zeyu-dev/pods/<pod>:$PORT/proxy/v1/completions" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gate-b","prompt":"The capital of France is","max_tokens":16,"temperature":0}'
+kill $PROXY
 ```
+
+Expected: a JSON completion whose `choices[0].text` continues the prompt.
 
 ## Cleaning up
 
