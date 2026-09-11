@@ -52,6 +52,9 @@ const (
 // fakeRuntime is an in-process RuntimeClient that records calls and hands out
 // monotonic ports, so the reconcile loop can be tested without a real runtime.
 type fakeRuntime struct {
+	// onActivate runs at the moment an engine would start, so a test can see
+	// what the API server already holds by then.
+	onActivate      func(*ActivateRequest)
 	activateCalls   []ActivateRequest
 	deactivateCalls []DeactivateRequest
 	kvLimitCalls    []SetKVLimitRequest
@@ -73,6 +76,9 @@ type fakeRuntime struct {
 }
 
 func (f *fakeRuntime) Activate(_ context.Context, _ string, _ int, req *ActivateRequest) (*ActivateResponse, error) {
+	if f.onActivate != nil {
+		f.onActivate(req)
+	}
 	f.activateCalls = append(f.activateCalls, *req)
 	if f.failActivate {
 		return &ActivateResponse{Status: "error", Message: "boom"}, fmt.Errorf("activate failed: boom")

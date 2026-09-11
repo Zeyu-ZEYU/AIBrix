@@ -244,8 +244,15 @@ func (r *ModelClaimReconciler) collectPodLedgers(
 		}
 	}
 
+	// Deliberately not the cached client. An instance written moments ago may
+	// not have reached the informer yet, and an instance missing from the
+	// account is memory a second claim would be told is free.
+	reader := client.Reader(r.Client)
+	if r.LedgerReader != nil {
+		reader = r.LedgerReader
+	}
 	list := &modelv1alpha1.ModelClaimList{}
-	if err := r.List(ctx, list, client.InNamespace(namespace)); err != nil {
+	if err := reader.List(ctx, list, client.InNamespace(namespace)); err != nil {
 		// Without the claim list every ledger would understate what its card
 		// already owes, which is the one direction that overcommits a GPU.
 		klog.ErrorS(err, "collect pod ledgers: list model claims", "namespace", namespace)

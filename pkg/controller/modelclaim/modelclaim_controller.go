@@ -39,6 +39,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -93,17 +94,24 @@ type ModelClaimReconciler struct {
 	// request-counter deltas needed for conservative KV allocation. It is not a
 	// desired-state store; runtime snapshots remain authoritative after restart.
 	PoolPolicy *poolPolicyManager
+	// LedgerReader reads ModelClaims for the memory ledger without going
+	// through the informer cache. The cache lags a write by however long the
+	// watch event takes to come back, and an instance missing from the ledger
+	// is an instance whose memory a second claim would hand out again. Nil
+	// falls back to the cached client, which is what the tests use.
+	LedgerReader client.Reader
 }
 
 // Add creates a new ModelClaim controller and registers it with the Manager.
 func Add(mgr manager.Manager, _ config.RuntimeConfig) error {
 	r := &ModelClaimReconciler{
-		Client:     mgr.GetClient(),
-		Scheme:     mgr.GetScheme(),
-		Recorder:   mgr.GetEventRecorderFor(controllerName),
-		Runtime:    NewRuntimeClient(),
-		Locality:   uniformLocality{},
-		PoolPolicy: newPoolPolicyManager(time.Now),
+		Client:       mgr.GetClient(),
+		Scheme:       mgr.GetScheme(),
+		Recorder:     mgr.GetEventRecorderFor(controllerName),
+		Runtime:      NewRuntimeClient(),
+		Locality:     uniformLocality{},
+		PoolPolicy:   newPoolPolicyManager(time.Now),
+		LedgerReader: mgr.GetAPIReader(),
 		SnapshotCache: newRuntimeSnapshotCache(
 			defaultRuntimeSnapshotTTL, time.Now,
 		),
@@ -121,6 +129,13 @@ func Add(mgr manager.Manager, _ config.RuntimeConfig) error {
 		Watches(&corev1.Pod{},
 			handler.EnqueueRequestsFromMapFunc(enqueueModelClaimsForPod(mgr.GetClient())),
 			builder.WithPredicates(modelPoolPodFilter())).
+		// Placement is a decision about shared GPU memory, and it is made by
+		// reading every claim's instances and writing this one's. Running two
+		// of these at once would let both read the account before either
+		// wrote, and each would find the same bytes free. This is one, on
+		// purpose, not by default: raising it needs the ledger to serialize
+		// itself first.
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
 	if err != nil {
 		return err
@@ -426,6 +441,25 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 		}
 		pod := ordered[0]
 
+		// Write the claim on the card before taking it. The memory is spent
+		// the moment the engine starts, and the only record of that is this
+		// instance, so it has to exist first. Were the order reversed and this
+		// write then failed, the engine would be running with nothing in the
+		// account naming it, and the next reconcile would place a second one.
+		//
+		// The cost of this order is the opposite failure, which is the cheap
+		// one: an instance recorded whose engine never started.
+		// reconcileInstanceHealth sees no such engine in the pod's snapshot and
+		// clears it.
+		pm.Status.Instances = append(pm.Status.Instances, modelv1alpha1.ModelClaimInstance{
+			Pod:   pod.Name,
+			Port:  0,
+			Phase: modelv1alpha1.ModelClaimActivating,
+		})
+		if err := r.Status().Update(ctx, pm); err != nil {
+			return fmt.Errorf("reserve %s on %s: %w", servedModelName(pm), pod.Name, err)
+		}
+
 		resp, aerr := r.Runtime.Activate(ctx, pod.Status.PodIP, DefaultRuntimePort, &ActivateRequest{
 			ModelName:    servedModelName(pm),
 			ArtifactURL:  pm.Spec.ArtifactURL,
@@ -440,23 +474,27 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 		})
 		if aerr != nil {
 			recordActivation(pm.Namespace, servedModelName(pm), false)
+			// The engine did not start, so give the card back. Writing the
+			// reservation first guards against a crash between the two steps,
+			// where the record is all that would remain; a failure we can
+			// actually see is undone here, and the caller's status update
+			// persists the shorter list. Left in place it would hold the card
+			// for good, because reconcileInstanceHealth has no way to tell an
+			// engine that never started from one still booting.
+			pm.Status.Instances = pm.Status.Instances[:len(pm.Status.Instances)-1]
 			return aerr
 		}
+		pm.Status.Instances[len(pm.Status.Instances)-1].Port = resp.Port
 
 		// The engine is spawned but not yet serveable (boot/compile). Keep the
-		// model NOT routable — stamp the non-routable marker (port 0), record the
-		// instance as Activating with its real port — until reconcileInstanceHealth
-		// confirms the engine is ready, then it flips the annotation to the real
-		// port. This means the gateway never routes to a still-booting engine.
+		// model NOT routable — stamp the non-routable marker (port 0) — until
+		// reconcileInstanceHealth confirms the engine is ready, then it flips
+		// the annotation to the real port. This means the gateway never routes
+		// to a still-booting engine.
 		if err := r.annotateWarmPod(ctx, pm, pod, 0); err != nil {
 			return err
 		}
 
-		pm.Status.Instances = append(pm.Status.Instances, modelv1alpha1.ModelClaimInstance{
-			Pod:   pod.Name,
-			Port:  resp.Port,
-			Phase: modelv1alpha1.ModelClaimActivating,
-		})
 		load[pod.Name]++
 		// Charge the card now, so a second instance in this same round sees
 		// the space the first one just took rather than counting it twice.

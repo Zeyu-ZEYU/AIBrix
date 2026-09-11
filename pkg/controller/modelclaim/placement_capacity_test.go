@@ -26,7 +26,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 // bigClaim declares a model that needs more than half a test card, so two of
@@ -173,4 +175,53 @@ func TestPlacementWalksPastItsFavouriteCard(t *testing.T) {
 	assert.Equal(t, "warm-2", placed.Status.Instances[0].Pod,
 		"placement passes over its favourite card because that card has no room")
 	require.Len(t, runtime.activateCalls, 1)
+}
+
+// TestPlacementRecordsTheInstanceBeforeStartingTheEngine pins the order these
+// two steps happen in. The card is spent the moment the engine starts, and the
+// instance is the only record of that, so it has to be durable first. Were the
+// order reversed and the write then failed, an engine would be running with
+// nothing naming it and the next reconcile would start a second one.
+func TestPlacementRecordsTheInstanceBeforeStartingTheEngine(t *testing.T) {
+	claim := bigClaim("early")
+	warm1, _ := twoWarmPods()
+	r, runtime := newReconciler(t, claim, warm1)
+
+	var recordedWhenEngineStarted []modelv1alpha1.ModelClaimInstance
+	runtime.onActivate = func(*ActivateRequest) {
+		recordedWhenEngineStarted = getModel(t, r, "early").Status.Instances
+	}
+
+	reconcileOnce(t, r, "early")
+
+	require.Len(t, recordedWhenEngineStarted, 1,
+		"the API server must already hold the instance when the engine starts")
+	assert.Equal(t, "warm-1", recordedWhenEngineStarted[0].Pod)
+	assert.Equal(t, modelv1alpha1.ModelClaimActivating, recordedWhenEngineStarted[0].Phase)
+	assert.Equal(t, int32(0), recordedWhenEngineStarted[0].Port,
+		"the port is not known yet, and zero keeps the model unroutable")
+
+	placed := getModel(t, r, "early").Status.Instances
+	require.Len(t, placed, 1)
+	assert.NotZero(t, placed[0].Port, "the real port lands once the engine is up")
+}
+
+// TestPlacementReleasesTheCardWhenTheEngineFailsToStart is the other half:
+// the reservation is undone on a failure we can see. Left in place it would
+// hold the card for good, since nothing can tell an engine that never started
+// from one still booting.
+func TestPlacementReleasesTheCardWhenTheEngineFailsToStart(t *testing.T) {
+	claim := bigClaim("doomed")
+	warm1, _ := twoWarmPods()
+	r, runtime := newReconciler(t, claim, warm1)
+	runtime.failActivate = true
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: testNamespace, Name: "doomed"},
+	})
+	require.NoError(t, err, "an activation failure is reported on the claim, not returned")
+
+	got := getModel(t, r, "doomed")
+	assert.Empty(t, got.Status.Instances, "the card must go back to the pool")
+	assert.Equal(t, modelv1alpha1.ModelClaimFailed, got.Status.Phase)
 }
