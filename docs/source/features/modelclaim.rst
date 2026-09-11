@@ -376,6 +376,13 @@ engine, set to the claim's ``perGPU.kvFloorBytes`` when the instance is
 placed. The limit the engine actually runs under is the KV capacity in the
 runtime snapshot, described below.
 
+A new engine starts under kvcached's own default, which is most of the free
+memory on its GPU. Once it reports ready, the controller writes the
+instance's ``kvLimitBytes`` into the engine's segment, and on a Pod with a GPU
+the instance stays ``Activating`` until the snapshot shows that limit in
+force. An ``Active`` instance whose limit has drifted, for example after its
+engine restarted, keeps its route while the limit is written back.
+
 Inspect claim status and the routing annotation:
 
 .. code-block:: bash
@@ -467,6 +474,13 @@ The controller distributes remaining KV capacity among active models using
 bounded inflight requests and completion deltas. A configured limit is a
 kvcached capacity ceiling, not an immediate physical HBM allocation and not an
 OOM guarantee.
+
+.. note::
+
+   Leave ``reclaim`` unset for now. The controller holds every engine at its
+   instance's ``kvLimitBytes`` and writes that limit back whenever the segment
+   holds another, so a reclaim plan would be undone on the next reconcile and
+   written again on the next policy tick.
 
 The JSON parser rejects unknown fields. An invalid policy is disabled and
 reported with an ``InvalidPoolPolicy`` Event:

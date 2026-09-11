@@ -71,6 +71,10 @@ type fakeRuntime struct {
 	models map[string]ModelInfo
 	// snapshots reports per-pod runtime state for Phase-2 placement tests.
 	snapshots map[string]*RuntimeSnapshot
+	// startKVCapacity is the limit a new engine's kvcached segment holds
+	// before anyone sets one. A test that needs an engine with no segment
+	// sets it to -1.
+	startKVCapacity int64
 	// nilSnapshots lets defensive-path tests model an invalid client response.
 	nilSnapshots map[string]bool
 }
@@ -92,11 +96,12 @@ func (f *fakeRuntime) Activate(_ context.Context, _ string, _ int, req *Activate
 		f.models = map[string]ModelInfo{}
 	}
 	f.models[req.ModelName] = ModelInfo{
-		ModelName: req.ModelName,
-		Port:      port,
-		IPCName:   req.IPCName,
-		Phase:     "active",
-		Ready:     !f.notReady,
+		ModelName:    req.ModelName,
+		Port:         port,
+		IPCName:      req.IPCName,
+		Phase:        "active",
+		Ready:        !f.notReady,
+		KVTotalBytes: f.startKVCapacity,
 	}
 	return &ActivateResponse{Status: "success", ModelName: req.ModelName, Port: port, IPCName: req.IPCName}, nil
 }
@@ -109,6 +114,12 @@ func (f *fakeRuntime) Deactivate(_ context.Context, _ string, _ int, req *Deacti
 
 func (f *fakeRuntime) SetKVLimit(_ context.Context, _ string, _ int, req *SetKVLimitRequest) (*RuntimeOperationResponse, error) {
 	f.kvLimitCalls = append(f.kvLimitCalls, *req)
+	// kvctl writes the segment before the runtime answers, so the next
+	// snapshot already shows the new limit.
+	if model, found := f.models[req.ModelName]; found {
+		model.KVTotalBytes = req.LimitBytes
+		f.models[req.ModelName] = model
+	}
 	return &RuntimeOperationResponse{
 		Status: "success", ModelName: req.ModelName, OperationID: req.OperationID, Applied: true, Phase: "active",
 	}, nil
@@ -179,12 +190,14 @@ func (f *fakeRuntime) Snapshot(_ context.Context, podIP string, _ int) (*Runtime
 			ready = !f.notReady
 		}
 		result.Models = append(result.Models, RuntimeSnapshotModel{
-			ModelName: model.ModelName,
-			Port:      model.Port,
-			IPCName:   model.IPCName,
-			Phase:     model.Phase,
-			Alive:     model.Phase != "failed",
-			Ready:     ready,
+			ModelName:       model.ModelName,
+			Port:            model.Port,
+			IPCName:         model.IPCName,
+			Phase:           model.Phase,
+			Alive:           model.Phase != "failed",
+			Ready:           ready,
+			KVUsedBytes:     model.KVUsedBytes,
+			KVCapacityBytes: model.KVTotalBytes,
 		})
 	}
 	return result, nil
@@ -271,6 +284,10 @@ const (
 	testKVFloorBytes   int64 = 2 << 30
 )
 
+// testEngineDefaultKVBytes is the limit a fake engine's segment starts with,
+// standing in for kvcached's default: most of the card, far above any floor.
+const testEngineDefaultKVBytes int64 = 80 << 30
+
 func newReconciler(t *testing.T, objs ...client.Object) (*ModelClaimReconciler, *fakeRuntime) {
 	t.Helper()
 	scheme := testScheme(t)
@@ -279,7 +296,7 @@ func newReconciler(t *testing.T, objs ...client.Object) (*ModelClaimReconciler, 
 		WithObjects(objs...).
 		WithStatusSubresource(&modelv1alpha1.ModelClaim{}).
 		Build()
-	runtime := &fakeRuntime{}
+	runtime := &fakeRuntime{startKVCapacity: testEngineDefaultKVBytes}
 	return &ModelClaimReconciler{
 		Client:     c,
 		Scheme:     scheme,
@@ -679,6 +696,9 @@ func TestReconcileActivatesOnCandidate(t *testing.T) {
 		warmPod("warm-2", "b300-pool-a", true, corev1.PodRunning),
 	)
 
+	// The first pass starts the engine and writes its KV limit. The second
+	// finds the limit in force and makes the engine routable.
+	reconcileOnce(t, r, pm.Name)
 	reconcileOnce(t, r, pm.Name)
 
 	require.Len(t, runtime.activateCalls, 1)
@@ -765,8 +785,10 @@ func TestReconcileReadinessGate(t *testing.T) {
 	assert.Contains(t, pod.Annotations[constants.ModelClaimPodAnnotationPrefix+"qwen2-7b"], `"port":0`,
 		"booting engine must not be routable")
 
-	// Engine reports ready -> flip to the real port, become Active.
+	// Engine reports ready -> flip to the real port, become Active. One pass
+	// writes its KV limit, and the next finds the limit in force.
 	runtime.notReady = false
+	reconcileOnce(t, r, pm.Name)
 	reconcileOnce(t, r, pm.Name)
 
 	got = getModel(t, r, pm.Name)
@@ -793,6 +815,7 @@ func TestReconcileActiveDemotedWhenUnhealthy(t *testing.T) {
 	)
 
 	reconcileOnce(t, r, pm.Name)
+	reconcileOnce(t, r, pm.Name)
 	got := getModel(t, r, pm.Name)
 	require.Equal(t, modelv1alpha1.ModelClaimActive, got.Status.Instances[0].Phase)
 
@@ -807,6 +830,95 @@ func TestReconcileActiveDemotedWhenUnhealthy(t *testing.T) {
 	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Namespace: testNamespace, Name: "warm-1"}, pod))
 	assert.Contains(t, pod.Annotations[constants.ModelClaimPodAnnotationPrefix+"qwen2-7b"], `"port":0`,
 		"unhealthy engine must be non-routable")
+}
+
+// warmPodAnnotation reads the routing annotation a claim holds on a warm pod.
+func warmPodAnnotation(t *testing.T, r *ModelClaimReconciler, podName, claimName string) string {
+	t.Helper()
+	pod := &corev1.Pod{}
+	require.NoError(t, r.Get(context.Background(),
+		types.NamespacedName{Namespace: testNamespace, Name: podName}, pod))
+	return pod.Annotations[constants.ModelClaimPodAnnotationPrefix+claimName]
+}
+
+// TestReconcileRoutesAGPUEngineOnlyOnceItsKVLimitIsInForce pins the gate. An
+// engine that reports ready is not routed to while its segment still holds
+// kvcached's default. The first pass writes the instance's limit, and the
+// pass that finds it in force makes the engine routable.
+func TestReconcileRoutesAGPUEngineOnlyOnceItsKVLimitIsInForce(t *testing.T) {
+	pm := withFinalizer(sampleModelClaim())
+	r, runtime := newReconciler(t, pm, warmPod("warm-1", "b300-pool-a", true, corev1.PodRunning))
+
+	reconcileOnce(t, r, pm.Name)
+
+	got := getModel(t, r, pm.Name)
+	require.Len(t, got.Status.Instances, 1)
+	assert.Equal(t, modelv1alpha1.ModelClaimActivating, got.Status.Instances[0].Phase,
+		"ready, but still under kvcached's default limit")
+	assert.Contains(t, warmPodAnnotation(t, r, "warm-1", pm.Name), `"port":0`)
+	require.Len(t, runtime.kvLimitCalls, 1)
+	assert.Equal(t, servedModelName(pm), runtime.kvLimitCalls[0].ModelName)
+	assert.Equal(t, testKVFloorBytes, runtime.kvLimitCalls[0].LimitBytes)
+
+	reconcileOnce(t, r, pm.Name)
+
+	got = getModel(t, r, pm.Name)
+	assert.Equal(t, modelv1alpha1.ModelClaimActive, got.Status.Instances[0].Phase)
+	assert.Contains(t, warmPodAnnotation(t, r, "warm-1", pm.Name),
+		fmt.Sprintf(`"port":%d`, got.Status.Instances[0].Port))
+	assert.Len(t, runtime.kvLimitCalls, 1, "a limit already in force is not written again")
+}
+
+// TestReconcileRewritesADriftedKVLimitWithoutDroppingTheRoute covers an engine
+// that restarted between two passes and came back under kvcached's default.
+// It keeps its route, and the limit is written again under a new operation
+// ID, since the runtime runs each ID only once.
+func TestReconcileRewritesADriftedKVLimitWithoutDroppingTheRoute(t *testing.T) {
+	pm := withFinalizer(sampleModelClaim())
+	r, runtime := newReconciler(t, pm, warmPod("warm-1", "b300-pool-a", true, corev1.PodRunning))
+	reconcileOnce(t, r, pm.Name)
+	reconcileOnce(t, r, pm.Name)
+	require.Equal(t, modelv1alpha1.ModelClaimActive, getModel(t, r, pm.Name).Status.Instances[0].Phase)
+	require.Len(t, runtime.kvLimitCalls, 1)
+
+	engine := runtime.models[servedModelName(pm)]
+	engine.KVTotalBytes = testEngineDefaultKVBytes
+	runtime.models[servedModelName(pm)] = engine
+	reconcileOnce(t, r, pm.Name)
+
+	assert.Equal(t, modelv1alpha1.ModelClaimActive, getModel(t, r, pm.Name).Status.Instances[0].Phase)
+	require.Len(t, runtime.kvLimitCalls, 2)
+	assert.Equal(t, testKVFloorBytes, runtime.kvLimitCalls[1].LimitBytes)
+	assert.NotEqual(t, runtime.kvLimitCalls[0].OperationID, runtime.kvLimitCalls[1].OperationID)
+}
+
+// TestReconcileRoutesAnEngineWithoutAGPUAtOnce covers a pod Kubernetes gave no
+// GPU. It has no kvcached limit, so its engine is routed as soon as it is
+// ready and nothing is written.
+func TestReconcileRoutesAnEngineWithoutAGPUAtOnce(t *testing.T) {
+	pm := withFinalizer(sampleModelClaim())
+	r, runtime := newReconciler(t, pm, cpuOnlyWarmPod("warm-1", "b300-pool-a"))
+
+	reconcileOnce(t, r, pm.Name)
+
+	assert.Equal(t, modelv1alpha1.ModelClaimActive, getModel(t, r, pm.Name).Status.Instances[0].Phase)
+	assert.Empty(t, runtime.kvLimitCalls)
+}
+
+// TestReconcileWritesNoKVLimitIntoAMissingSegment covers an engine that reports
+// ready before it has a segment. kvctl reports success for a segment that
+// does not exist, so a write would look applied and do nothing. The
+// controller writes nothing and keeps the engine off its route.
+func TestReconcileWritesNoKVLimitIntoAMissingSegment(t *testing.T) {
+	pm := withFinalizer(sampleModelClaim())
+	r, runtime := newReconciler(t, pm, warmPod("warm-1", "b300-pool-a", true, corev1.PodRunning))
+	runtime.startKVCapacity = -1
+
+	reconcileOnce(t, r, pm.Name)
+	reconcileOnce(t, r, pm.Name)
+
+	assert.Empty(t, runtime.kvLimitCalls)
+	assert.Equal(t, modelv1alpha1.ModelClaimActivating, getModel(t, r, pm.Name).Status.Instances[0].Phase)
 }
 
 func TestReconcileSnapshotCorrectsRouteToActualRuntimePort(t *testing.T) {
@@ -954,12 +1066,10 @@ func TestReconcileSleepingInstanceRemovesRouteAndWakeRestoresIt(t *testing.T) {
 	active := getModel(t, r, pm.Name)
 	require.Len(t, active.Status.Instances, 1)
 	port := active.Status.Instances[0].Port
-	runtime.models[servedModelName(pm)] = ModelInfo{
-		ModelName: servedModelName(pm),
-		Port:      port,
-		Phase:     "sleeping",
-		Ready:     false,
-	}
+	// The engine's segment survives a sleep, and so does the limit in it.
+	engine := runtime.models[servedModelName(pm)]
+	engine.Phase, engine.Ready = "sleeping", false
+	runtime.models[servedModelName(pm)] = engine
 
 	reconcileOnce(t, r, pm.Name)
 
@@ -978,12 +1088,8 @@ func TestReconcileSleepingInstanceRemovesRouteAndWakeRestoresIt(t *testing.T) {
 		"sleeping engine must be non-routable")
 	assert.Len(t, runtime.activateCalls, 1, "sleep must keep its assigned instance")
 
-	runtime.models[servedModelName(pm)] = ModelInfo{
-		ModelName: servedModelName(pm),
-		Port:      port,
-		Phase:     "active",
-		Ready:     false,
-	}
+	engine.Phase = "active"
+	runtime.models[servedModelName(pm)] = engine
 	runtime.notReady = true
 	reconcileOnce(t, r, pm.Name)
 
@@ -1120,6 +1226,9 @@ func TestReconcileAnnotatesWarmPodForRouting(t *testing.T) {
 	pm := withFinalizer(sampleModelClaim())
 	r, _ := newReconciler(t, pm, warmPod("warm-1", "b300-pool-a", true, corev1.PodRunning))
 
+	// The route carries the real port once the engine's KV limit is in
+	// force, which takes a second pass.
+	reconcileOnce(t, r, pm.Name)
 	reconcileOnce(t, r, pm.Name)
 
 	got := getModel(t, r, pm.Name)

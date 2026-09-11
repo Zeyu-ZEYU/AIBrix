@@ -545,6 +545,10 @@ func (r *ModelClaimReconciler) collectPlacementStates(
 // controller never promotes an engine merely because its old status entry was
 // Active. A snapshot failure leaves the last known routing in place rather
 // than guessing that a live engine has disappeared.
+//
+// It is also where an instance's KV limit reaches its engine. On a pod with a
+// GPU, a ready engine is promoted only once its kvcached segment holds the
+// limit the instance records, and the limit is written whenever it does not.
 func (r *ModelClaimReconciler) reconcileInstanceHealth(ctx context.Context, pm *modelv1alpha1.ModelClaim) {
 	served := servedModelName(pm)
 	for i := range pm.Status.Instances {
@@ -569,6 +573,18 @@ func (r *ModelClaimReconciler) reconcileInstanceHealth(ctx context.Context, pm *
 		if observed != nil {
 			observedPort = observed.Port
 		}
+		pod := &corev1.Pod{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: pm.Namespace, Name: inst.Pod}, pod); err != nil {
+			continue
+		}
+
+		// An engine on a GPU becomes routable only once its KV limit is in
+		// force, meaning its kvcached segment holds the limit this instance
+		// records. Until then it runs under kvcached's default, which is most
+		// of the card's free memory, and traffic would let it grow that far. A
+		// pod without a GPU has no such limit to wait for.
+		serving := engineServing(observed, observedPort)
+		limitInForce := kvLimitInForce(pod, inst, observed)
 
 		desiredPhase := modelv1alpha1.ModelClaimActivating
 		routingPort := int32(0)
@@ -579,15 +595,17 @@ func (r *ModelClaimReconciler) reconcileInstanceHealth(ctx context.Context, pm *
 			desiredPhase = modelv1alpha1.ModelClaimFailed
 		case observed != nil && observed.Phase == runtimePhaseSleeping:
 			desiredPhase = modelv1alpha1.ModelClaimSleeping
-		case observed != nil && observed.Ready && observedPort > 0:
+		case serving && (limitInForce || inst.Phase == modelv1alpha1.ModelClaimActive):
+			// The gate is on becoming routable, not on staying so. A serving
+			// engine whose limit has drifted keeps its route while the limit
+			// is written back below, in this same pass.
 			desiredPhase = modelv1alpha1.ModelClaimActive
 			routingPort = observedPort
 		}
-
-		pod := &corev1.Pod{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: pm.Namespace, Name: inst.Pod}, pod); err != nil {
-			continue
+		if serving && !limitInForce {
+			r.writeKVLimit(ctx, pm, inst, pod, ip, snapshot, observed)
 		}
+
 		if err := r.annotateWarmPodWithState(
 			ctx, pm, pod, routingPort, routingStateForPhase(desiredPhase),
 		); err != nil {
@@ -627,6 +645,64 @@ func (r *ModelClaimReconciler) reconcileInstanceHealth(ctx context.Context, pm *
 			}
 		}
 	}
+}
+
+// engineServing reports whether the runtime shows an engine that could take
+// traffic now: ready, and on a real port.
+func engineServing(observed *RuntimeSnapshotModel, port int32) bool {
+	return observed != nil && observed.Ready && port > 0
+}
+
+// kvLimitInForce reports whether an engine's kvcached segment holds the limit
+// its instance records. A pod without a GPU has no such limit to wait for.
+func kvLimitInForce(pod *corev1.Pod, inst *modelv1alpha1.ModelClaimInstance, observed *RuntimeSnapshotModel) bool {
+	return podGPUCount(*pod) == 0 ||
+		(observed != nil && observed.KVCapacityBytes == inst.KVLimitBytes)
+}
+
+// writeKVLimit asks the runtime to put an instance's KV limit into its
+// engine's kvcached segment. The runtime runs kvctl before it answers, so the
+// next snapshot shows whether the limit landed. The answer itself cannot say,
+// because kvctl reports success even when the segment it was pointed at does
+// not exist.
+func (r *ModelClaimReconciler) writeKVLimit(
+	ctx context.Context,
+	pm *modelv1alpha1.ModelClaim,
+	inst *modelv1alpha1.ModelClaimInstance,
+	pod *corev1.Pod,
+	ip string,
+	snapshot *RuntimeSnapshot,
+	observed *RuntimeSnapshotModel,
+) {
+	if observed.KVCapacityBytes < 0 {
+		// No segment yet, so a write would land nowhere and still be reported
+		// as done. A real engine builds its KV cache before it reports ready,
+		// so for one this does not last.
+		klog.V(2).InfoS("engine is ready but has no kvcached segment yet",
+			"model", pm.Name, "pod", inst.Pod)
+		return
+	}
+	// The runtime runs each operation ID once. An engine that restarts goes
+	// back to kvcached's default, and writing the same limit again must not
+	// be taken for a repeat of the first write, so the ID names the
+	// observation it answers.
+	observedAt := snapshot.ObservedAt
+	if observedAt.IsZero() {
+		observedAt = time.Now()
+	}
+	operationID := fmt.Sprintf("kv-limit/%s/%s/%s/%d/%d",
+		pm.Namespace, pm.Name, pod.UID, inst.KVLimitBytes, observedAt.UnixNano())
+	if _, err := r.Runtime.SetKVLimit(ctx, ip, DefaultRuntimePort, &SetKVLimitRequest{
+		ModelName: observed.ModelName, LimitBytes: inst.KVLimitBytes, OperationID: operationID,
+	}); err != nil {
+		r.Recorder.Eventf(pm, corev1.EventTypeWarning, "KVLimitFailed",
+			"model %s on pod %s: could not set the KV limit to %s: %v",
+			servedModelName(pm), inst.Pod, gibibytes(inst.KVLimitBytes), err)
+		return
+	}
+	r.Recorder.Eventf(pm, corev1.EventTypeNormal, "KVLimitSet",
+		"model %s on pod %s: KV limit set to %s, from %s",
+		servedModelName(pm), inst.Pod, gibibytes(inst.KVLimitBytes), gibibytes(observed.KVCapacityBytes))
 }
 
 // snapshotModelForClaim resolves runtime state by ClaimRef UID when the
