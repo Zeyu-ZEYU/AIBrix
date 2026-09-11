@@ -74,6 +74,10 @@ const (
 	// or remove a model, against fix the selector or add pods.
 	reasonInsufficientCapacity = "InsufficientCapacity"
 
+	// reasonNoMatchingPods marks a claim whose selector matched no usable warm
+	// pod at all.
+	reasonNoMatchingPods = "NoMatchingPods"
+
 	// reasonWaitingForRoom marks a claim that some warm pod could hold, but
 	// that no warm pod can show room for now, for instance while an engine on
 	// the card is still starting. Unlike InsufficientCapacity, it can clear
@@ -101,6 +105,9 @@ type ModelClaimReconciler struct {
 	// request-counter deltas needed for conservative KV allocation. It is not a
 	// desired-state store; runtime snapshots remain authoritative after restart.
 	PoolPolicy *poolPolicyManager
+	// Backoff paces the retries of claims that no warm pod will take. Nil
+	// keeps every claim at the ordinary pace.
+	Backoff *placementBackoff
 	// LedgerReader reads ModelClaims for the memory ledger without going
 	// through the informer cache. The cache lags a write by however long the
 	// watch event takes to come back, and an instance missing from the ledger
@@ -118,6 +125,7 @@ func Add(mgr manager.Manager, _ config.RuntimeConfig) error {
 		Runtime:      NewRuntimeClient(),
 		Locality:     uniformLocality{},
 		PoolPolicy:   newPoolPolicyManager(time.Now),
+		Backoff:      newPlacementBackoff(),
 		LedgerReader: mgr.GetAPIReader(),
 	}
 
@@ -161,11 +169,15 @@ func Add(mgr manager.Manager, _ config.RuntimeConfig) error {
 func (r *ModelClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	pm := &modelv1alpha1.ModelClaim{}
 	if err := r.Get(ctx, req.NamespacedName, pm); err != nil {
+		if apierrors.IsNotFound(err) {
+			r.Backoff.Forget(req.NamespacedName)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
 	// Handle deletion: deactivate attached instances, then drop the finalizer.
 	if !pm.DeletionTimestamp.IsZero() {
+		r.Backoff.Forget(req.NamespacedName)
 		if controllerutil.ContainsFinalizer(pm, ModelClaimFinalizer) {
 			r.deactivateInstances(ctx, pm)
 			clearClaimMetrics(pm.Namespace, servedModelName(pm))
@@ -251,7 +263,29 @@ func (r *ModelClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// claim status is persisted so a policy failure cannot block activation
 	// or route-health convergence for this claim.
 	r.reconcilePoolPolicies(ctx, candidates)
-	return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, nil
+	return ctrl.Result{RequeueAfter: r.requeueAfter(pm)}, nil
+}
+
+// requeueAfter paces a claim's next reconcile. A claim that no warm pod will
+// take, and that has no instance anywhere, backs off from 10 seconds to 5
+// minutes. Whatever could change that answer changes a warm pod, and every
+// change to a warm pod reconciles every claim at once.
+//
+// A claim that is only waiting for room keeps the ordinary pace, because its
+// wait can end with no event at all, when an engine on the card becomes ready
+// or an old one exits. So does a claim with an instance, whose engine's
+// health and KV limit are checked on every pass.
+func (r *ModelClaimReconciler) requeueAfter(pm *modelv1alpha1.ModelClaim) time.Duration {
+	key := types.NamespacedName{Namespace: pm.Namespace, Name: pm.Name}
+	scheduled := meta.FindStatusCondition(pm.Status.Conditions,
+		string(modelv1alpha1.ModelClaimConditionTypeScheduled))
+	refused := scheduled != nil && scheduled.Status == metav1.ConditionFalse &&
+		(scheduled.Reason == reasonInsufficientCapacity || scheduled.Reason == reasonNoMatchingPods)
+	if refused && len(pm.Status.Instances) == 0 {
+		return r.Backoff.Next(key)
+	}
+	r.Backoff.Forget(key)
+	return DefaultRequeueDuration
 }
 
 // requeueOnConflict lets the next reconcile work from the latest API object.
@@ -431,7 +465,7 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 			// show room, which asks for patience. Every pod is provably too full,
 			// which asks for capacity or for a model to leave. Or no pod matched
 			// at all, which asks for a different selector or more pods.
-			reason, message := "NoMatchingPods", "no available candidate warm pod for model"
+			reason, message := reasonNoMatchingPods, "no available candidate warm pod for model"
 			switch {
 			case len(waits) > 0:
 				reason = reasonWaitingForRoom

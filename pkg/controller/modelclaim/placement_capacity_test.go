@@ -19,6 +19,7 @@ package modelclaim
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -334,4 +335,64 @@ func TestPlacementWaitsRatherThanGivesUp(t *testing.T) {
 	assert.Equal(t, reasonWaitingForRoom, condition.Reason)
 	assert.Contains(t, condition.Message, "on warm-2, the engine of starting cannot be read yet")
 	assert.Contains(t, condition.Message, "1 more pod(s) could never hold it")
+}
+
+// reconcileFor runs one reconcile and returns when it asked to run again.
+func reconcileFor(t *testing.T, r *ModelClaimReconciler, name string) time.Duration {
+	t.Helper()
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: testNamespace, Name: name},
+	})
+	require.NoError(t, err)
+	return result.RequeueAfter
+}
+
+// TestRequeueBacksOffARefusedClaim covers a claim no card could ever hold. It
+// is looked at less and less often while nothing changes, and once it is
+// placed it returns to the ordinary pace with its count forgotten.
+func TestRequeueBacksOffARefusedClaim(t *testing.T) {
+	ctx := context.Background()
+	first, third := bigClaim("first"), bigClaim("third")
+	warm1 := warmPod("warm-1", "b300-pool-a", true, corev1.PodRunning)
+	r, _ := newReconciler(t, first, third, warm1)
+	reconcileOnce(t, r, "first")
+
+	assert.Equal(t, 10*time.Second, reconcileFor(t, r, "third"))
+	assert.Equal(t, 20*time.Second, reconcileFor(t, r, "third"))
+	assert.Equal(t, 40*time.Second, reconcileFor(t, r, "third"))
+
+	require.NoError(t, r.Delete(ctx, getModel(t, r, "first")))
+	reconcileOnce(t, r, "first")
+
+	assert.Equal(t, DefaultRequeueDuration, reconcileFor(t, r, "third"))
+	require.Len(t, getModel(t, r, "third").Status.Instances, 1)
+	assert.Empty(t, r.Backoff.attempts, "a placed claim and a deleted one leave nothing behind")
+}
+
+// TestRequeueBacksOffAClaimWithNoPods covers a selector that matches nothing.
+// A pod appearing reconciles the claim at once, so the timer can be slow.
+func TestRequeueBacksOffAClaimWithNoPods(t *testing.T) {
+	r, _ := newReconciler(t, bigClaim("lonely"))
+
+	assert.Equal(t, 10*time.Second, reconcileFor(t, r, "lonely"))
+	assert.Equal(t, 20*time.Second, reconcileFor(t, r, "lonely"))
+}
+
+// TestRequeueKeepsTheOrdinaryPaceWhileWaiting covers a claim held back only
+// because an engine on the card is still starting. That wait can end with no
+// event at all, so the claim is not backed off.
+func TestRequeueKeepsTheOrdinaryPaceWhileWaiting(t *testing.T) {
+	first := claimNeeding("first", 20*gibibyte, 4*gibibyte)
+	second := claimNeeding("second", 20*gibibyte, 4*gibibyte)
+	warm1 := warmPod("warm-1", "b300-pool-a", true, corev1.PodRunning)
+	r, runtime := newReconciler(t, first, second, warm1)
+	runtime.notReady = true
+	reconcileOnce(t, r, "first")
+
+	for i := 0; i < 3; i++ {
+		assert.Equal(t, DefaultRequeueDuration, reconcileFor(t, r, "second"))
+	}
+	condition := scheduledCondition(t, getModel(t, r, "second"))
+	require.NotNil(t, condition)
+	assert.Equal(t, reasonWaitingForRoom, condition.Reason)
 }
