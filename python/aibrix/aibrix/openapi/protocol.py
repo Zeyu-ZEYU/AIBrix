@@ -227,9 +227,8 @@ class RuntimeAcceleratorSnapshot(NoProtectedBaseModel):
     id: str
     hbm_total_bytes: int
     hbm_free_bytes: int
-    # Memory an engine can take on this card: the total less whatever the
-    # driver keeps for itself, measured while nothing held the card. Negative
-    # when it could not be measured.
+    # Memory an engine can take on this card: the total less what the driver
+    # and firmware reserve, as NVML reports it. Negative when NVML cannot say.
     hbm_usable_bytes: int = -1
 
 

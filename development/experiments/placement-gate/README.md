@@ -13,9 +13,9 @@ What it should show:
 ## The numbers, and why
 
 The pool's card reports `hbm_total_bytes = 102625181696`, 95.58 GiB. The runtime
-measures what an engine can actually take while nothing holds the card and
-reports it as `hbm_usable_bytes`; on this pool that came to `102363824128`,
-95.33 GiB, the driver keeping the other 249 MiB.
+reports what an engine can actually take as `hbm_usable_bytes`: the total less
+what NVML says the driver and firmware reserve. On this pool that is
+`102363824128`, 95.33 GiB, the driver keeping the other 249 MiB.
 
 Each claim declares 50 GiB of maximum footprint and a 10 GiB KV floor, so its
 `minimumReserveBytes` is 60 GiB. One card holding one of them has
@@ -42,9 +42,9 @@ kubectl get --raw \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["accelerators"])'
 ```
 
-A card reporting `hbm_usable_bytes: -1` was already in use when its runtime
-started, so it was never measured and no model can be placed on it. That needs
-the pod restarted on an idle card, not a workaround.
+A card reporting `hbm_usable_bytes: -1` is one NVML would not give a reservation
+for, usually because the driver or the NVML binding in the image is too old.
+No model can be placed on it until that is fixed.
 
 ## Before running
 

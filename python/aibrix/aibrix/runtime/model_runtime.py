@@ -244,15 +244,40 @@ def cached_artifacts(cache_dir: Optional[str] = None) -> List[str]:
     return sorted(artifacts)
 
 
-# Usable memory per GPU UUID, measured once and kept for the life of the
-# process. Guarded by _nvml_lock, which already serializes every NVML read.
-_hbm_usable_bytes: Dict[str, int] = {}
-
-# HBM_USABLE_UNKNOWN is reported for a card whose usable memory could not be
-# measured. It is negative rather than zero because zero is a number the
-# control plane's arithmetic accepts, and a card of unknown size must not be
-# mistaken for a card with nothing left.
+# HBM_USABLE_UNKNOWN is reported for a card whose usable memory NVML cannot
+# give. It is negative rather than zero because zero is a number the control
+# plane's arithmetic accepts, and a card of unknown size must not be mistaken
+# for a card with nothing left.
 HBM_USABLE_UNKNOWN = -1
+
+
+def _hbm_usable_bytes(pynvml, handle) -> int:
+    """Memory an engine can take on this card: the total less what the driver
+    and firmware reserve for themselves.
+
+    NVML's v2 memory query reports that reservation as a field of its own. It
+    does not move with traffic, so the answer is the same whether the card is
+    idle or busy; on the card this was developed against it matched, to the
+    byte, what the bare card left free.
+
+    Nothing is reported in its place when the query is unavailable. Free memory
+    plus per-process usage was considered and rejected: the two readings are
+    not taken at once, so memory released between them is counted twice, and
+    usage NVML does not attribute to a process is missed. That figure can land
+    on either side of the truth, and a card reported larger than it is lets the
+    control plane place a model that does not fit.
+    """
+    version = getattr(pynvml, "nvmlMemory_v2", None)
+    if version is None:
+        return HBM_USABLE_UNKNOWN
+    try:
+        info = pynvml.nvmlDeviceGetMemoryInfo(handle, version=version)
+        total, reserved = int(info.total), int(info.reserved)
+    except Exception:
+        return HBM_USABLE_UNKNOWN
+    if reserved < 0 or reserved >= total:
+        return HBM_USABLE_UNKNOWN
+    return total - reserved
 
 
 def _nvml_compute_processes(pynvml, handle):
@@ -283,9 +308,7 @@ def gpu_memory_observation() -> tuple[
     logic, which is necessary because vLLM uses worker child processes.
 
     Each accelerator also carries hbm_usable_bytes, the memory an engine can
-    actually take on that card. It is measured once, on the first read that
-    finds the card with no compute process on it, and is HBM_USABLE_UNKNOWN
-    until then.
+    actually take on that card, or HBM_USABLE_UNKNOWN when NVML cannot say.
     """
     with _nvml_lock:
         initialized = False
@@ -303,27 +326,15 @@ def gpu_memory_observation() -> tuple[
                 if isinstance(device_id, bytes):
                     device_id = device_id.decode()
                 device_id = str(device_id)
-                processes = list(_nvml_compute_processes(pynvml, handle))
-                if device_id not in _hbm_usable_bytes and not processes:
-                    # Nothing holds this card, so everything free right now is
-                    # everything an engine will ever get: the remainder belongs
-                    # to the driver and is never returned. The runtime starts
-                    # before it launches any engine, so this is measured on the
-                    # first read and then kept, because later reads see the
-                    # engines' own allocations and cannot tell them apart from
-                    # the driver's.
-                    _hbm_usable_bytes[device_id] = int(info.free)
                 snapshots.append(
                     {
                         "id": device_id,
                         "hbm_total_bytes": int(info.total),
                         "hbm_free_bytes": int(info.free),
-                        "hbm_usable_bytes": _hbm_usable_bytes.get(
-                            device_id, HBM_USABLE_UNKNOWN
-                        ),
+                        "hbm_usable_bytes": _hbm_usable_bytes(pynvml, handle),
                     }
                 )
-                for process in processes:
+                for process in _nvml_compute_processes(pynvml, handle):
                     pid = getattr(process, "pid", None)
                     used = getattr(process, "usedGpuMemory", None)
                     if pid is None or used is None:

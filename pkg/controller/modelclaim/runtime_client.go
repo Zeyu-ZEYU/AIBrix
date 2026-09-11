@@ -152,11 +152,10 @@ type RuntimeAcceleratorSnapshot struct {
 	HBMTotalBytes int64  `json:"hbm_total_bytes"`
 	HBMFreeBytes  int64  `json:"hbm_free_bytes"`
 	// HBMUsableBytes is how much of this card an engine can actually take: the
-	// total less whatever the driver keeps for itself. The runtime measures it
-	// once, while nothing held the card, because after an engine starts its
-	// allocations cannot be told apart from the driver's. It is negative when
-	// the runtime could not measure it, and zero from a runtime too old to
-	// report it at all; both mean the card cannot be sized.
+	// total less what the driver and firmware reserve, which NVML reports as a
+	// field of its own and which does not move with traffic. It is negative
+	// when NVML could not report that reservation, and zero from a runtime too
+	// old to send the field at all; both mean the card cannot be sized.
 	HBMUsableBytes int64 `json:"hbm_usable_bytes"`
 }
 

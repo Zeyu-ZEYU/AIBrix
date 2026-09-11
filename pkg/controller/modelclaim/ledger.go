@@ -80,13 +80,13 @@ const (
 	// is a pod the account does not cover.
 	ledgerNoGPU
 	// ledgerGPUMeasureFailed means the runtime answered, the pod does hold
-	// GPUs, and the runtime could not size at least one of them.
+	// GPUs, and the runtime could not size at least one of them: NVML did not
+	// report the driver's reservation, or reported no accelerator at all, or
+	// fewer than this model's parallelism spans.
 	//
-	// Unlike ledgerUnknown this does not clear on its own. A runtime measures
-	// a card only while nothing holds it, which it can do just once, before it
-	// launches its first engine. Having missed that moment it reports the card
-	// as unmeasurable for as long as the process lives, so this state means a
-	// person has to restart the pod.
+	// Unlike ledgerUnknown this rarely clears on its own. Its usual causes are
+	// a driver or NVML binding too old to report the reservation, and a device
+	// that never reached the container, and each needs a person to look.
 	ledgerGPUMeasureFailed
 )
 
