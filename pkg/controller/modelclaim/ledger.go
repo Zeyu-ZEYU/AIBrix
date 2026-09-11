@@ -63,25 +63,34 @@ const hbmUsableUnknown int64 = -1
 type ledgerState int
 
 const (
-	// ledgerUnread is the zero value, and deliberately so. Looking up a pod
-	// that is not in the account yields this, and the honest thing for that
-	// lookup to say is that nothing is known about the pod. A state meaning
-	// "complete" here would let an untracked pod pass as an empty card.
-	ledgerUnread ledgerState = iota
-	// ledgerComplete means the card's size is known and every instance on it
-	// declared what it costs.
+	// ledgerUnknown is the zero value, and deliberately so. Nothing was
+	// learned about this pod: its runtime did not answer, the claim list
+	// failed, or the pod is not in the account at all. Looking up a pod that
+	// was never tracked yields this, and the honest thing for that lookup to
+	// say is that it knows nothing. A zero meaning "complete" would let an
+	// untracked pod pass as an empty card.
+	//
+	// This usually clears on its own. A pod that was still starting, or a
+	// request that timed out, has an answer on the next reconcile.
+	ledgerUnknown ledgerState = iota
+	// ledgerComplete means the card's size is known and room can be computed.
 	ledgerComplete
 	// ledgerNoGPU means Kubernetes allocated this pod no GPU, so there is no
 	// GPU memory to keep an account of. This is not a gap in the account; it
 	// is a pod the account does not cover.
 	ledgerNoGPU
-	// ledgerNoCardSize means the pod holds GPUs but the runtime reported no
-	// usable size for them: it saw no accelerator at all, or not as many as
-	// this model's parallelism spans.
-	ledgerNoCardSize
+	// ledgerGPUMeasureFailed means the runtime answered, the pod does hold
+	// GPUs, and the runtime could not size at least one of them.
+	//
+	// Unlike ledgerUnknown this does not clear on its own. A runtime measures
+	// a card only while nothing holds it, which it can do just once, before it
+	// launches its first engine. Having missed that moment it reports the card
+	// as unmeasurable for as long as the process lives, so this state means a
+	// person has to restart the pod.
+	ledgerGPUMeasureFailed
 )
 
-// String is the phrase an operator reads, so each value says what is wrong
+// String is the phrase an operator reads, so each value says what happened
 // rather than naming itself.
 func (s ledgerState) String() string {
 	switch s {
@@ -89,10 +98,10 @@ func (s ledgerState) String() string {
 		return "complete"
 	case ledgerNoGPU:
 		return "the pod holds no GPU"
-	case ledgerNoCardSize:
-		return "the runtime reported no usable size for this pod's GPUs"
+	case ledgerGPUMeasureFailed:
+		return "the runtime could not measure this pod's GPUs"
 	default:
-		return "no readable account for this pod"
+		return "nothing is known about this pod"
 	}
 }
 
@@ -123,6 +132,18 @@ type podLedger struct {
 	// is ledgerComplete.
 	HBMUsableBytes int64
 	Instances      []ledgerInstance
+}
+
+// ledgerFor returns a pod's account, and an unknown one for a pod that has
+// none. Every read goes through here rather than indexing the map directly: a
+// bare lookup yields the zero value, whose HBMUsableBytes is zero rather than
+// hbmUsableUnknown, and zero is a number arithmetic accepts. Only ledgerFor
+// keeps the invariant that a size is real exactly when the state is complete.
+func ledgerFor(ledgers map[string]podLedger, pod string) podLedger {
+	if ledger, found := ledgers[pod]; found {
+		return ledger
+	}
+	return podLedger{State: ledgerUnknown, HBMUsableBytes: hbmUsableUnknown}
 }
 
 // chargeable reports whether an instance can still be added to this pod's
@@ -212,9 +233,9 @@ func (r *ModelClaimReconciler) collectPodLedgers(
 		case podGPUCount(*pod) == 0:
 			ledgers[pod.Name] = podLedger{State: ledgerNoGPU, HBMUsableBytes: hbmUsableUnknown}
 		case !found:
-			ledgers[pod.Name] = podLedger{State: ledgerUnread, HBMUsableBytes: hbmUsableUnknown}
+			ledgers[pod.Name] = podLedger{State: ledgerUnknown, HBMUsableBytes: hbmUsableUnknown}
 		case !state.HBMUsableKnown:
-			ledgers[pod.Name] = podLedger{State: ledgerNoCardSize, HBMUsableBytes: hbmUsableUnknown}
+			ledgers[pod.Name] = podLedger{State: ledgerGPUMeasureFailed, HBMUsableBytes: hbmUsableUnknown}
 		default:
 			ledgers[pod.Name] = podLedger{
 				State:          ledgerComplete,
@@ -229,7 +250,7 @@ func (r *ModelClaimReconciler) collectPodLedgers(
 		// already owes, which is the one direction that overcommits a GPU.
 		klog.ErrorS(err, "collect pod ledgers: list model claims", "namespace", namespace)
 		for name := range ledgers {
-			ledgers[name] = podLedger{State: ledgerUnread, HBMUsableBytes: hbmUsableUnknown}
+			ledgers[name] = podLedger{State: ledgerUnknown, HBMUsableBytes: hbmUsableUnknown}
 		}
 		return ledgers
 	}
@@ -248,8 +269,8 @@ func (r *ModelClaimReconciler) collectPodLedgers(
 			if instance.Phase == modelv1alpha1.ModelClaimFailed {
 				continue
 			}
-			ledger, tracked := ledgers[instance.Pod]
-			if !tracked || !ledger.chargeable() {
+			ledger := ledgerFor(ledgers, instance.Pod)
+			if !ledger.chargeable() {
 				continue
 			}
 			ledger.Instances = append(ledger.Instances, ledgerInstance{

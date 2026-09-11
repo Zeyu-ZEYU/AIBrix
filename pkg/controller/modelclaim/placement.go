@@ -135,7 +135,7 @@ func filterCandidates(
 		if alreadyOn[pod.Name] {
 			continue
 		}
-		if room, tooFull := provablyTooFull(ledgers[pod.Name], minimumReserveBytes); tooFull {
+		if room, tooFull := provablyTooFull(ledgerFor(ledgers, pod.Name), minimumReserveBytes); tooFull {
 			refusals = append(refusals, podRefusal{Pod: pod.Name, MaximumRoomBytes: room})
 			continue
 		}

@@ -502,12 +502,12 @@ func TestFilterCandidatesOnlyRefusesWhatItCanProve(t *testing.T) {
 		},
 		{
 			name:    "a silent sidecar is a different constraint, not this one",
-			ledger:  podLedger{State: ledgerUnread},
+			ledger:  podLedger{State: ledgerUnknown},
 			reserve: 600 * gibibyte,
 		},
 		{
 			name:    "a card whose size could not be read is not proof of anything",
-			ledger:  podLedger{State: ledgerNoCardSize},
+			ledger:  podLedger{State: ledgerGPUMeasureFailed},
 			reserve: 600 * gibibyte,
 		},
 		{
@@ -620,7 +620,7 @@ func TestFilterCandidatesRefusesAFullCardButNotAnUnknownOne(t *testing.T) {
 				KVFloorBytes:          4 * gibibyte,
 			}},
 		},
-		"unread": {State: ledgerUnread},
+		"unread": {State: ledgerUnknown},
 	}
 
 	feasible, refusals := filterCandidates(candidates, map[string]bool{}, ledgers, gibibyte)

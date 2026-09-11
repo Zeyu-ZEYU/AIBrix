@@ -460,7 +460,7 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 		load[pod.Name]++
 		// Charge the card now, so a second instance in this same round sees
 		// the space the first one just took rather than counting it twice.
-		ledger := ledgers[pod.Name]
+		ledger := ledgerFor(ledgers, pod.Name)
 		ledger.Instances = append(ledger.Instances, ledgerInstance{
 			Claim:                 types.NamespacedName{Namespace: pm.Namespace, Name: pm.Name},
 			MaximumFootprintBytes: pm.Spec.PerGPU.MaximumFootprintBytes,

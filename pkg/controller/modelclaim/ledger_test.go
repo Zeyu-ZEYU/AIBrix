@@ -138,11 +138,11 @@ func TestMaximumRoomBytes(t *testing.T) {
 		},
 		{
 			name:   "no snapshot means no answer",
-			ledger: podLedger{State: ledgerUnread},
+			ledger: podLedger{State: ledgerUnknown},
 		},
 		{
 			name:   "no usable card size means no answer",
-			ledger: podLedger{State: ledgerNoCardSize},
+			ledger: podLedger{State: ledgerGPUMeasureFailed},
 		},
 	}
 	for _, tc := range cases {
@@ -331,7 +331,7 @@ func TestCollectPodLedgers(t *testing.T) {
 		runtime.nilSnapshots = map[string]bool{candidates[0].Status.PodIP: true}
 		ledgers := collectLedgers(t, r, candidates)
 
-		assert.Equal(t, ledgerUnread, ledgers["warm-1"].State)
+		assert.Equal(t, ledgerUnknown, ledgers["warm-1"].State)
 		_, known := ledgers["warm-1"].MaximumRoomBytes()
 		assert.False(t, known)
 	})
@@ -350,7 +350,7 @@ func TestCollectPodLedgers(t *testing.T) {
 
 		assert.NotEqual(t, ledgerNoGPU, ledgers["warm-1"].State,
 			"a pod that holds a card is never mistaken for one without")
-		assert.Equal(t, ledgerNoCardSize, ledgers["warm-1"].State)
+		assert.Equal(t, ledgerGPUMeasureFailed, ledgers["warm-1"].State)
 	})
 
 	t.Run("a pod Kubernetes gave no GPU is outside the account", func(t *testing.T) {
@@ -393,8 +393,8 @@ func TestCollectPodLedgersMarksEveryUnsizedCard(t *testing.T) {
 
 	want := map[string]ledgerState{
 		"sized":     ledgerComplete,
-		"blind":     ledgerUnread,
-		"sightless": ledgerNoCardSize,
+		"blind":     ledgerUnknown,
+		"sightless": ledgerGPUMeasureFailed,
 		"card-free": ledgerNoGPU,
 	}
 	for name, state := range want {
@@ -407,5 +407,59 @@ func TestCollectPodLedgersMarksEveryUnsizedCard(t *testing.T) {
 		}
 		assert.Equalf(t, hbmUsableUnknown, ledger.HBMUsableBytes,
 			"pod %s: an unsized card must not report a number arithmetic accepts", name)
+	}
+}
+
+func TestLedgerForNeverYieldsTheBareZeroValue(t *testing.T) {
+	// A pod missing from the account must come back unknown with the sentinel,
+	// not as the zero value whose size is zero. Zero is a number the room
+	// arithmetic accepts; the sentinel is not.
+	ledgers := map[string]podLedger{
+		"tracked": {State: ledgerComplete, HBMUsableBytes: 80 * gibibyte},
+	}
+
+	known := ledgerFor(ledgers, "tracked")
+	assert.Equal(t, ledgerComplete, known.State)
+	assert.Equal(t, 80*gibibyte, known.HBMUsableBytes)
+
+	missing := ledgerFor(ledgers, "never-seen")
+	assert.Equal(t, ledgerUnknown, missing.State)
+	assert.Equal(t, hbmUsableUnknown, missing.HBMUsableBytes,
+		"a bare map lookup would have given zero here")
+
+	_, answerable := missing.MaximumRoomBytes()
+	assert.False(t, answerable)
+	assert.False(t, missing.chargeable())
+}
+
+// TestCollectPodLedgersKeepsTheSizeSentinelInvariant states the rule the
+// sentinel exists for, over every state the collector can produce: a size is
+// real exactly when the state is complete.
+func TestCollectPodLedgersKeepsTheSizeSentinelInvariant(t *testing.T) {
+	r, runtime := newReconciler(t)
+	withCards := gpuPods(runtime, "sized", "silent", "unmeasured")
+	runtime.nilSnapshots = map[string]bool{withCards[1].Status.PodIP: true}
+	runtime.snapshots[withCards[2].Status.PodIP] = &RuntimeSnapshot{
+		Accelerators: []RuntimeAcceleratorSnapshot{
+			{ID: "GPU-0", HBMTotalBytes: testHBMTotalBytes, HBMUsableBytes: hbmUsableUnknown},
+		},
+	}
+	candidates := append(withCards, *cpuOnlyWarmPod("card-free", "b300-pool-a"))
+	ledgers := collectLedgers(t, r, candidates)
+
+	want := map[string]ledgerState{
+		"sized":      ledgerComplete,
+		"silent":     ledgerUnknown,
+		"unmeasured": ledgerGPUMeasureFailed,
+		"card-free":  ledgerNoGPU,
+	}
+	for name, state := range want {
+		ledger := ledgerFor(ledgers, name)
+		require.Equalf(t, state, ledger.State, "pod %s", name)
+		if state == ledgerComplete {
+			assert.Greaterf(t, ledger.HBMUsableBytes, int64(0), "pod %s", name)
+			continue
+		}
+		assert.Equalf(t, hbmUsableUnknown, ledger.HBMUsableBytes, "pod %s", name)
 	}
 }
