@@ -79,6 +79,10 @@ const (
 	// the card is still starting. Unlike InsufficientCapacity, it can clear
 	// with nothing in the ledger changing.
 	reasonWaitingForRoom = "WaitingForRoom"
+
+	// reasonPlaced marks a claim whose latest placement succeeded. It replaces
+	// whatever reason held the claim back before.
+	reasonPlaced = "Placed"
 )
 
 // ModelClaimReconciler reconciles a ModelClaim object.
@@ -521,6 +525,14 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 		ledgers[pod.Name] = ledger
 		r.Recorder.Eventf(pm, corev1.EventTypeNormal, "Activating",
 			"model %s engine starting on pod %s:%d", servedModelName(pm), pod.Name, resp.Port)
+		// The claim is on a card now, so whatever held it back last time no
+		// longer does.
+		meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
+			Type:    string(modelv1alpha1.ModelClaimConditionTypeScheduled),
+			Status:  metav1.ConditionTrue,
+			Reason:  reasonPlaced,
+			Message: fmt.Sprintf("placed on pod %s", pod.Name),
+		})
 	}
 	return nil
 }

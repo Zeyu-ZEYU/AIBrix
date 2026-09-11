@@ -111,6 +111,11 @@ func TestPlacementFreesUpWhenAModelLeaves(t *testing.T) {
 	placed := getModel(t, r, "third")
 	require.Len(t, placed.Status.Instances, 1)
 	assert.Equal(t, "warm-1", placed.Status.Instances[0].Pod)
+	condition := scheduledCondition(t, placed)
+	require.NotNil(t, condition)
+	assert.Equal(t, metav1.ConditionTrue, condition.Status, "the refusal no longer holds")
+	assert.Equal(t, reasonPlaced, condition.Reason)
+	assert.Contains(t, condition.Message, "warm-1")
 }
 
 // TestPlacementDistinguishesNoRoomFromNoPods keeps the two situations apart in
@@ -271,6 +276,10 @@ func TestPlacementWaitsWhileAnEngineOnTheCardIsStarting(t *testing.T) {
 	placed := getModel(t, r, "second")
 	require.Len(t, placed.Status.Instances, 1)
 	assert.Equal(t, "warm-1", placed.Status.Instances[0].Pod)
+	condition = scheduledCondition(t, placed)
+	require.NotNil(t, condition)
+	assert.Equal(t, metav1.ConditionTrue, condition.Status, "it is no longer waiting")
+	assert.Equal(t, reasonPlaced, condition.Reason)
 }
 
 // TestPlacementWaitsForAnEngineUnderKVCachedsDefault covers a resident engine
