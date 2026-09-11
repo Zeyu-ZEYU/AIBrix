@@ -87,9 +87,6 @@ type ModelClaimReconciler struct {
 	// Layer 2 node weight-cache signal). Phase 1 uses uniformLocality, so
 	// placement is load-only until node state reporting is added back.
 	Locality LocalityProvider
-	// SnapshotCache stores bounded runtime observations for placement. It is
-	// process-local so a leader restart naturally rehydrates from sidecars.
-	SnapshotCache *runtimeSnapshotCache
 	// PoolPolicy serializes controller-local policy ticks and retains only the
 	// request-counter deltas needed for conservative KV allocation. It is not a
 	// desired-state store; runtime snapshots remain authoritative after restart.
@@ -112,9 +109,6 @@ func Add(mgr manager.Manager, _ config.RuntimeConfig) error {
 		Locality:     uniformLocality{},
 		PoolPolicy:   newPoolPolicyManager(time.Now),
 		LedgerReader: mgr.GetAPIReader(),
-		SnapshotCache: newRuntimeSnapshotCache(
-			defaultRuntimeSnapshotTTL, time.Now,
-		),
 	}
 
 	err := ctrl.NewControllerManagedBy(mgr).
@@ -519,6 +513,12 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 	return nil
 }
 
+// collectPlacementStates reads each candidate's runtime snapshot afresh, on
+// every placement. The ledger's minimum room comes from these snapshots, and a
+// copy even a few seconds old can predate an engine that restarted and put
+// kvcached's default limit back, which would make the room look larger than
+// it is. A pod whose runtime does not answer gets no state, and the ledger
+// treats it as a pod nothing is known about.
 func (r *ModelClaimReconciler) collectPlacementStates(
 	ctx context.Context,
 	candidates []corev1.Pod,
@@ -526,20 +526,14 @@ func (r *ModelClaimReconciler) collectPlacementStates(
 	parallelism int64,
 ) map[string]PodPlacementState {
 	states := make(map[string]PodPlacementState, len(candidates))
-	if r.SnapshotCache == nil {
-		return states
-	}
 	for i := range candidates {
 		pod := &candidates[i]
-		key := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
-		snapshot, ok := r.SnapshotCache.Get(key, pod.UID, func() (*RuntimeSnapshot, error) {
-			return r.Runtime.Snapshot(ctx, pod.Status.PodIP, DefaultRuntimePort)
-		})
-		if !ok {
+		snapshot, err := r.Runtime.Snapshot(ctx, pod.Status.PodIP, DefaultRuntimePort)
+		if err != nil || snapshot == nil {
+			klog.V(4).InfoS("placement could not read a runtime snapshot", "pod", klog.KObj(pod), "err", err)
 			continue
 		}
-		state := placementStateFromSnapshot(snapshot, artifactURL, parallelism)
-		states[pod.Name] = state
+		states[pod.Name] = placementStateFromSnapshot(snapshot, artifactURL, parallelism)
 	}
 	return states
 }

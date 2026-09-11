@@ -303,9 +303,6 @@ func newReconciler(t *testing.T, objs ...client.Object) (*ModelClaimReconciler, 
 		Recorder:   record.NewFakeRecorder(32),
 		Runtime:    runtime,
 		PoolPolicy: newPoolPolicyManager(time.Now),
-		SnapshotCache: newRuntimeSnapshotCache(
-			defaultRuntimeSnapshotTTL, time.Now,
-		),
 	}, runtime
 }
 

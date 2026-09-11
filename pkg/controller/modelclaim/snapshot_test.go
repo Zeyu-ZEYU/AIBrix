@@ -17,68 +17,10 @@ limitations under the License.
 package modelclaim
 
 import (
-	"errors"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-	"k8s.io/apimachinery/pkg/types"
 )
-
-func TestRuntimeSnapshotCacheUsesFreshEntry(t *testing.T) {
-	now := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
-	cache := newRuntimeSnapshotCache(5*time.Second, func() time.Time { return now })
-	key := types.NamespacedName{Namespace: "default", Name: "warm-1"}
-	calls := 0
-	fetch := func() (*RuntimeSnapshot, error) {
-		calls++
-		return &RuntimeSnapshot{CachedArtifacts: []string{"hf://Org/M1"}}, nil
-	}
-
-	first, ok := cache.Get(key, types.UID("pod-uid"), fetch)
-	require.True(t, ok)
-	assert.Equal(t, []string{"hf://Org/M1"}, first.CachedArtifacts)
-	second, ok := cache.Get(key, types.UID("pod-uid"), fetch)
-	require.True(t, ok)
-	assert.Equal(t, first, second)
-	assert.Equal(t, 1, calls)
-}
-
-func TestRuntimeSnapshotCacheDropsExpiredEntryAfterRefreshFailure(t *testing.T) {
-	now := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
-	cache := newRuntimeSnapshotCache(5*time.Second, func() time.Time { return now })
-	key := types.NamespacedName{Namespace: "default", Name: "warm-1"}
-
-	_, ok := cache.Get(key, types.UID("pod-uid"), func() (*RuntimeSnapshot, error) {
-		return &RuntimeSnapshot{}, nil
-	})
-	require.True(t, ok)
-	now = now.Add(6 * time.Second)
-
-	snapshot, ok := cache.Get(key, types.UID("pod-uid"), func() (*RuntimeSnapshot, error) {
-		return nil, errors.New("runtime unavailable")
-	})
-	assert.False(t, ok)
-	assert.Nil(t, snapshot)
-}
-
-func TestRuntimeSnapshotCacheRefreshesWhenPodIsRecreated(t *testing.T) {
-	now := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
-	cache := newRuntimeSnapshotCache(time.Hour, func() time.Time { return now })
-	key := types.NamespacedName{Namespace: "default", Name: "warm-1"}
-	calls := 0
-	fetch := func() (*RuntimeSnapshot, error) {
-		calls++
-		return &RuntimeSnapshot{}, nil
-	}
-
-	_, ok := cache.Get(key, types.UID("old-pod"), fetch)
-	require.True(t, ok)
-	_, ok = cache.Get(key, types.UID("new-pod"), fetch)
-	require.True(t, ok)
-	assert.Equal(t, 2, calls)
-}
 
 func TestPlacementStateFromSnapshot(t *testing.T) {
 	snapshot := &RuntimeSnapshot{
@@ -103,6 +45,29 @@ func TestPlacementStateFromSnapshot(t *testing.T) {
 	assert.Equal(t, int64(300), groupState.HBMFreeBytes)
 	assert.Equal(t, int64(35), groupState.KVUsedBytes)
 	assert.Equal(t, 2, groupState.ModelCount)
+}
+
+// TestPlacementReadsEveryDecisionAfresh pins that placement never decides on
+// a copy. An engine that went back to kvcached's default between two
+// decisions, as it does when it restarts, is seen at the second one.
+func TestPlacementReadsEveryDecisionAfresh(t *testing.T) {
+	resident := ledgerClaim("resident", "warm-1", 20*gibibyte, 4*gibibyte)
+	resident.UID = "resident-uid"
+	resident.Status.Instances[0].KVLimitBytes = 4 * gibibyte
+	r, runtime := newReconciler(t, resident)
+	candidates := gpuPods(runtime, "warm-1")
+	stated := runtime.snapshots[candidates[0].Status.PodIP]
+	stated.Models = []RuntimeSnapshotModel{engineOf(resident, 4*gibibyte, gibibyte)}
+
+	before, known := collectLedgers(t, r, candidates)["warm-1"].MinimumRoomBytes()
+	assert.True(t, known)
+
+	stated.Models[0].KVCapacityBytes = 80 * gibibyte
+	after, known := collectLedgers(t, r, candidates)["warm-1"].MinimumRoomBytes()
+	assert.True(t, known)
+
+	assert.Equal(t, before-76*gibibyte, after,
+		"the second decision must see the limit the engine holds now")
 }
 
 func TestPlacementStateFromSnapshotSkipsEnginesWithoutASegment(t *testing.T) {
