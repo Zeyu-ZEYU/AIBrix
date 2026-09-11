@@ -69,6 +69,10 @@ type fakeRuntime struct {
 	// models tracks the engines the fake currently hosts, keyed by served
 	// model name, so Snapshot can drive the controller's readiness gate.
 	models map[string]ModelInfo
+	// enginePods records the pod IP each engine was started on, so a pod's
+	// snapshot reports only its own engines. An engine a test puts into
+	// models directly has no entry, and every pod reports it.
+	enginePods map[string]string
 	// snapshots reports per-pod runtime state for Phase-2 placement tests.
 	snapshots map[string]*RuntimeSnapshot
 	// startKVCapacity is the limit a new engine's kvcached segment holds
@@ -79,7 +83,7 @@ type fakeRuntime struct {
 	nilSnapshots map[string]bool
 }
 
-func (f *fakeRuntime) Activate(_ context.Context, _ string, _ int, req *ActivateRequest) (*ActivateResponse, error) {
+func (f *fakeRuntime) Activate(_ context.Context, podIP string, _ int, req *ActivateRequest) (*ActivateResponse, error) {
 	if f.onActivate != nil {
 		f.onActivate(req)
 	}
@@ -103,12 +107,17 @@ func (f *fakeRuntime) Activate(_ context.Context, _ string, _ int, req *Activate
 		Ready:        !f.notReady,
 		KVTotalBytes: f.startKVCapacity,
 	}
+	if f.enginePods == nil {
+		f.enginePods = map[string]string{}
+	}
+	f.enginePods[req.ModelName] = podIP
 	return &ActivateResponse{Status: "success", ModelName: req.ModelName, Port: port, IPCName: req.IPCName}, nil
 }
 
 func (f *fakeRuntime) Deactivate(_ context.Context, _ string, _ int, req *DeactivateRequest) error {
 	f.deactivateCalls = append(f.deactivateCalls, *req)
 	delete(f.models, req.ModelName)
+	delete(f.enginePods, req.ModelName)
 	return nil
 }
 
@@ -175,6 +184,9 @@ func (f *fakeRuntime) Snapshot(_ context.Context, podIP string, _ int) (*Runtime
 		}}
 	}
 	for _, model := range f.models {
+		if pod, placed := f.enginePods[model.ModelName]; placed && pod != podIP {
+			continue
+		}
 		present := false
 		for i := range result.Models {
 			if result.Models[i].ModelName == model.ModelName {
