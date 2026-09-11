@@ -18,6 +18,8 @@ package modelclaim
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	modelv1alpha1 "github.com/vllm-project/aibrix/api/model/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -217,6 +219,25 @@ func (l podLedger) MinimumRoomBytes() (int64, bool) {
 		room -= instance.MaximumFootprintBytes + instance.KVUpperBoundBytes
 	}
 	return room, true
+}
+
+// whyMinimumRoomUnknown says, for an operator, why MinimumRoomBytes has no
+// answer. It gives the first cause it finds, and nothing when there is none.
+func (l podLedger) whyMinimumRoomUnknown() string {
+	if l.State != ledgerComplete {
+		return l.State.String()
+	}
+	if len(l.UnaccountedEngines) > 0 {
+		return "the runtime reports engines no claim accounts for: " +
+			strings.Join(l.UnaccountedEngines, ", ")
+	}
+	for _, instance := range l.Instances {
+		if instance.KVUpperBoundBytes < 0 {
+			return fmt.Sprintf("the engine of %s cannot be read yet: it is starting, "+
+				"restarting, or has no kvcached segment", instance.Claim.Name)
+		}
+	}
+	return ""
 }
 
 // kvUpperBoundBytes is the most KV memory an instance's engine can hold before

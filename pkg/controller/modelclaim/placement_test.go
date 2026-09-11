@@ -33,19 +33,30 @@ func namedPod(name string) corev1.Pod {
 	return corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name}}
 }
 
-// mustFilter runs the filter with no ledger, for the tests that are about the
-// other constraints and say nothing about memory.
+// outsideTheAccount marks every candidate as a pod Kubernetes gave no GPU, so
+// that memory has no say at all.
+func outsideTheAccount(candidates []corev1.Pod) map[string]podLedger {
+	ledgers := make(map[string]podLedger, len(candidates))
+	for i := range candidates {
+		ledgers[candidates[i].Name] = podLedger{State: ledgerNoGPU, HBMUsableBytes: hbmUsableUnknown}
+	}
+	return ledgers
+}
+
+// mustFilter runs the filter with every pod outside the GPU account, for the
+// tests that are about the other constraints and say nothing about memory.
 func mustFilter(candidates []corev1.Pod, alreadyOn map[string]bool) []*corev1.Pod {
-	feasible, refusals := filterCandidates(candidates, alreadyOn, nil, 0)
-	if len(refusals) != 0 {
-		panic("filter refused a pod for memory with no ledger and no declared cost")
+	feasible, refusals, waits := filterCandidates(candidates, alreadyOn, outsideTheAccount(candidates), 0)
+	if len(refusals) != 0 || len(waits) != 0 {
+		panic("filter judged a pod on memory it has no account of")
 	}
 	return feasible
 }
 
 // topChoice composes the filter and the ranker the way the controller does,
-// with no ledger, so the tests written before the split keep asserting exactly
-// what they always did. Nil means every candidate was filtered out.
+// with every pod outside the GPU account, so the tests written before the
+// split keep asserting exactly what they always did. Nil means every candidate
+// was filtered out.
 func topChoice(
 	candidates []corev1.Pod,
 	alreadyOn map[string]bool,
@@ -54,7 +65,7 @@ func topChoice(
 	locality LocalityProvider,
 	states map[string]PodPlacementState,
 ) *corev1.Pod {
-	feasible, _ := filterCandidates(candidates, alreadyOn, nil, 0)
+	feasible, _, _ := filterCandidates(candidates, alreadyOn, outsideTheAccount(candidates), 0)
 	ordered := rankCandidates(feasible, load, model, locality, states)
 	if len(ordered) == 0 {
 		return nil
@@ -465,13 +476,14 @@ func TestFilterCandidatesRefusesACardThatCannotHoldTheModel(t *testing.T) {
 		"roomy": roomLedger(80 * gibibyte),
 	}
 
-	feasible, refusals := filterCandidates(candidates, map[string]bool{}, ledgers, 60*gibibyte)
+	feasible, refusals, waits := filterCandidates(candidates, map[string]bool{}, ledgers, 60*gibibyte)
 
 	require.Len(t, feasible, 1)
 	assert.Equal(t, "roomy", feasible[0].Name)
 	require.Len(t, refusals, 1)
 	assert.Equal(t, "full", refusals[0].Pod)
 	assert.Equal(t, 35*gibibyte, refusals[0].MaximumRoomBytes)
+	assert.Empty(t, waits, "an empty card can show all of itself")
 }
 
 func TestFilterCandidatesAcceptsAnExactFit(t *testing.T) {
@@ -480,53 +492,52 @@ func TestFilterCandidatesAcceptsAnExactFit(t *testing.T) {
 	candidates := []corev1.Pod{namedPod("exact")}
 	ledgers := map[string]podLedger{"exact": roomLedger(60 * gibibyte)}
 
-	feasible, refusals := filterCandidates(candidates, map[string]bool{}, ledgers, 60*gibibyte)
+	feasible, refusals, waits := filterCandidates(candidates, map[string]bool{}, ledgers, 60*gibibyte)
 
 	require.Len(t, feasible, 1)
 	assert.Empty(t, refusals)
+	assert.Empty(t, waits, "the second gate is not strict either")
 }
 
-// TestFilterCandidatesOnlyRefusesWhatItCanProve covers the caution in this
-// constraint. Each of these cases was admitted before the check existed and
-// has to stay admitted: the check only ever adds refusals.
+// TestFilterCandidatesOnlyRefusesWhatItCanProve covers the caution in the
+// first gate. None of these cards can be proved too full, so none is refused.
+// Only the pod with no GPU is admitted, though: the second gate lets a card
+// through only when it can show room, and the others cannot show anything.
 func TestFilterCandidatesOnlyRefusesWhatItCanProve(t *testing.T) {
 	cases := []struct {
-		name    string
-		ledger  podLedger
-		reserve int64
+		name     string
+		ledger   *podLedger
+		admitted bool
 	}{
 		{
-			name:    "a pod Kubernetes gave no GPU is not judged on GPU memory",
-			ledger:  podLedger{State: ledgerNoGPU},
-			reserve: 600 * gibibyte,
+			name:     "a pod Kubernetes gave no GPU is not judged on GPU memory",
+			ledger:   &podLedger{State: ledgerNoGPU},
+			admitted: true,
 		},
-		{
-			name:    "a silent sidecar is a different constraint, not this one",
-			ledger:  podLedger{State: ledgerUnknown},
-			reserve: 600 * gibibyte,
-		},
-		{
-			name:    "a card whose size could not be read is not proof of anything",
-			ledger:  podLedger{State: ledgerGPUMeasureFailed},
-			reserve: 600 * gibibyte,
-		},
-		{
-			name:    "a pod with no ledger entry at all",
-			reserve: 600 * gibibyte,
-		},
+		{name: "a silent sidecar", ledger: &podLedger{State: ledgerUnknown}},
+		{name: "a card whose size could not be read", ledger: &podLedger{State: ledgerGPUMeasureFailed}},
+		{name: "a pod with no ledger entry at all"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			candidates := []corev1.Pod{namedPod("pod")}
 			ledgers := map[string]podLedger{}
-			if tc.name != "a pod with no ledger entry at all" {
-				ledgers["pod"] = tc.ledger
+			if tc.ledger != nil {
+				ledgers["pod"] = *tc.ledger
 			}
 
-			feasible, refusals := filterCandidates(candidates, map[string]bool{}, ledgers, tc.reserve)
+			feasible, refusals, waits := filterCandidates(candidates, map[string]bool{}, ledgers, 600*gibibyte)
 
-			assert.Len(t, feasible, 1, "the pod must still be a candidate")
-			assert.Empty(t, refusals)
+			assert.Empty(t, refusals, "nothing here proves the card too full")
+			if tc.admitted {
+				assert.Len(t, feasible, 1)
+				assert.Empty(t, waits)
+				return
+			}
+			assert.Empty(t, feasible)
+			require.Len(t, waits, 1)
+			assert.False(t, waits[0].Known)
+			assert.NotEmpty(t, waits[0].Reason)
 		})
 	}
 }
@@ -545,7 +556,7 @@ func TestFilterCandidatesReportsAnOvercommittedCard(t *testing.T) {
 		}},
 	}}
 
-	feasible, refusals := filterCandidates(candidates, map[string]bool{}, ledgers, 1*gibibyte)
+	feasible, refusals, _ := filterCandidates(candidates, map[string]bool{}, ledgers, 1*gibibyte)
 
 	assert.Empty(t, feasible)
 	require.Len(t, refusals, 1)
@@ -561,7 +572,7 @@ func TestFilterCandidatesStillDropsPodsAlreadyHostingTheModel(t *testing.T) {
 		"full":    roomLedger(1 * gibibyte),
 	}
 
-	feasible, refusals := filterCandidates(
+	feasible, refusals, _ := filterCandidates(
 		candidates, map[string]bool{"hosting": true}, ledgers, 60*gibibyte)
 
 	assert.Empty(t, feasible)
@@ -608,7 +619,9 @@ func TestProvablyTooFullExemptsAPodWithNoGPUBeforeSizingItsCard(t *testing.T) {
 func TestFilterCandidatesRefusesAFullCardButNotAnUnknownOne(t *testing.T) {
 	// Zero room and unknown room both arrive as the number zero. They must not
 	// be treated alike: a card promised exactly all of itself is provably too
-	// small for anything, while a card nobody could read proves nothing.
+	// small for anything, while a card nobody could read proves nothing. So the
+	// unread card is not refused. It is held instead, since it cannot show room
+	// either.
 	candidates := []corev1.Pod{namedPod("full"), namedPod("unread")}
 	ledgers := map[string]podLedger{
 		"full": {
@@ -623,11 +636,105 @@ func TestFilterCandidatesRefusesAFullCardButNotAnUnknownOne(t *testing.T) {
 		"unread": {State: ledgerUnknown},
 	}
 
-	feasible, refusals := filterCandidates(candidates, map[string]bool{}, ledgers, gibibyte)
+	feasible, refusals, waits := filterCandidates(candidates, map[string]bool{}, ledgers, gibibyte)
 
-	require.Len(t, feasible, 1)
-	assert.Equal(t, "unread", feasible[0].Name)
+	assert.Empty(t, feasible, "neither card can show room now")
 	require.Len(t, refusals, 1)
 	assert.Equal(t, "full", refusals[0].Pod)
 	assert.Equal(t, int64(0), refusals[0].MaximumRoomBytes)
+	require.Len(t, waits, 1)
+	assert.Equal(t, "unread", waits[0].Pod)
+	assert.False(t, waits[0].Known)
+}
+
+// cardWith is a readable card holding one instance whose engine can grow to
+// upperBound, so a test states directly what the second gate sees.
+func cardWith(usable, footprint, floor, upperBound int64) podLedger {
+	return podLedger{
+		State:          ledgerComplete,
+		HBMUsableBytes: usable,
+		Instances: []ledgerInstance{{
+			Claim:                 types.NamespacedName{Namespace: testNamespace, Name: "resident"},
+			MaximumFootprintBytes: footprint,
+			KVFloorBytes:          floor,
+			KVLimitBytes:          floor,
+			KVUpperBoundBytes:     upperBound,
+		}},
+	}
+}
+
+// TestFilterCandidatesHoldsACardThatCannotShowRoomNow is the second gate. At
+// its floor the resident would leave room for the model, so the first gate
+// passes the card, but its engine can still grow to kvcached's default, so the
+// room is not there yet.
+func TestFilterCandidatesHoldsACardThatCannotShowRoomNow(t *testing.T) {
+	candidates := []corev1.Pod{namedPod("busy")}
+	ledgers := map[string]podLedger{"busy": cardWith(80*gibibyte, 20*gibibyte, 4*gibibyte, 70*gibibyte)}
+
+	feasible, refusals, waits := filterCandidates(candidates, map[string]bool{}, ledgers, 20*gibibyte)
+
+	assert.Empty(t, feasible)
+	assert.Empty(t, refusals, "at its floor the resident would leave 56 GiB")
+	require.Len(t, waits, 1)
+	assert.True(t, waits[0].Known)
+	assert.Equal(t, -10*gibibyte, waits[0].MinimumRoomBytes)
+}
+
+func TestFilterCandidatesAdmitsOnceTheEngineIsHeldToItsLimit(t *testing.T) {
+	candidates := []corev1.Pod{namedPod("settled")}
+	ledgers := map[string]podLedger{"settled": cardWith(80*gibibyte, 20*gibibyte, 4*gibibyte, 4*gibibyte)}
+
+	feasible, refusals, waits := filterCandidates(candidates, map[string]bool{}, ledgers, 20*gibibyte)
+
+	require.Len(t, feasible, 1)
+	assert.Empty(t, refusals)
+	assert.Empty(t, waits)
+}
+
+func TestFilterCandidatesHoldsACardWithAnUnreadEngine(t *testing.T) {
+	candidates := []corev1.Pod{namedPod("starting")}
+	ledgers := map[string]podLedger{"starting": cardWith(80*gibibyte, 20*gibibyte, 4*gibibyte, kvUpperBoundUnknown)}
+
+	feasible, refusals, waits := filterCandidates(candidates, map[string]bool{}, ledgers, 20*gibibyte)
+
+	assert.Empty(t, feasible)
+	assert.Empty(t, refusals)
+	require.Len(t, waits, 1)
+	assert.False(t, waits[0].Known)
+	assert.Contains(t, waits[0].Reason, "the engine of resident cannot be read yet")
+}
+
+func TestFilterCandidatesHoldsACardWithAnEngineNobodyAccountsFor(t *testing.T) {
+	shared := roomLedger(80 * gibibyte)
+	shared.UnaccountedEngines = []string{"leftover"}
+	candidates := []corev1.Pod{namedPod("shared")}
+
+	feasible, _, waits := filterCandidates(candidates, map[string]bool{}, map[string]podLedger{"shared": shared}, gibibyte)
+
+	assert.Empty(t, feasible)
+	require.Len(t, waits, 1)
+	assert.Contains(t, waits[0].Reason, "leftover")
+}
+
+func TestCannotProveRoomExemptsAPodWithNoGPU(t *testing.T) {
+	// As in the first gate, the exemption comes before any room is asked for:
+	// a pod with no GPU has no GPU memory to show.
+	_, short := cannotProveRoom(podLedger{State: ledgerNoGPU}, 600*gibibyte)
+	assert.False(t, short)
+}
+
+func TestSummarizeWaits(t *testing.T) {
+	message := summarizeWaits([]podWait{
+		{Pod: "a", Known: true, MinimumRoomBytes: 3 * gibibyte},
+		{Pod: "b", Reason: "the engine of resident cannot be read yet"},
+		{Pod: "c", Known: true, MinimumRoomBytes: 15*gibibyte + gibibyte/3},
+		{Pod: "d", Reason: "nothing is known about this pod"},
+	}, 2, 20*gibibyte)
+
+	assert.Contains(t, message, "needs 20.0 GiB per GPU")
+	assert.Contains(t, message, "the roomiest pod that could hold it, c, can vouch for only 15.3 GiB")
+	assert.NotContains(t, message, "3.0 GiB", "only the roomiest figure is worth reading")
+	assert.Contains(t, message, "on b, the engine of resident cannot be read yet")
+	assert.Contains(t, message, "1 more pod(s) cannot vouch for their room")
+	assert.Contains(t, message, "2 more pod(s) could never hold it")
 }

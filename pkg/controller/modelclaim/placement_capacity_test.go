@@ -227,3 +227,102 @@ func TestPlacementReleasesTheCardWhenTheEngineFailsToStart(t *testing.T) {
 	assert.Empty(t, got.Status.Instances, "the card must go back to the pool")
 	assert.Equal(t, modelv1alpha1.ModelClaimFailed, got.Status.Phase)
 }
+
+// claimNeeding declares a model with the given per-GPU cost.
+func claimNeeding(name string, footprint, floor int64) *modelv1alpha1.ModelClaim {
+	claim := bigClaim(name)
+	claim.Spec.PerGPU = modelv1alpha1.ModelClaimPerGPU{
+		MaximumFootprintBytes: footprint,
+		KVFloorBytes:          floor,
+	}
+	return claim
+}
+
+// TestPlacementWaitsWhileAnEngineOnTheCardIsStarting covers two models that
+// fit one card by their floors. They still cannot start side by side: nothing
+// can be read of the first engine until it is ready, and until its limit is
+// written it runs under kvcached's default. The second waits, says why, and
+// lands as soon as the first engine is held to its limit.
+func TestPlacementWaitsWhileAnEngineOnTheCardIsStarting(t *testing.T) {
+	first := claimNeeding("first", 20*gibibyte, 4*gibibyte)
+	second := claimNeeding("second", 20*gibibyte, 4*gibibyte)
+	warm1 := warmPod("warm-1", "b300-pool-a", true, corev1.PodRunning)
+	r, runtime := newReconciler(t, first, second, warm1)
+	runtime.notReady = true
+
+	reconcileOnce(t, r, "first")
+	require.Len(t, getModel(t, r, "first").Status.Instances, 1)
+
+	reconcileOnce(t, r, "second")
+
+	waiting := getModel(t, r, "second")
+	assert.Empty(t, waiting.Status.Instances)
+	condition := scheduledCondition(t, waiting)
+	require.NotNil(t, condition)
+	assert.Equal(t, reasonWaitingForRoom, condition.Reason)
+	assert.Contains(t, condition.Message, "the engine of first cannot be read yet")
+
+	// Once it is ready, the first engine's limit is written, and that is
+	// all the second needs.
+	runtime.notReady = false
+	reconcileOnce(t, r, "first")
+	reconcileOnce(t, r, "second")
+
+	placed := getModel(t, r, "second")
+	require.Len(t, placed.Status.Instances, 1)
+	assert.Equal(t, "warm-1", placed.Status.Instances[0].Pod)
+}
+
+// TestPlacementWaitsForAnEngineUnderKVCachedsDefault covers a resident engine
+// whose segment still allows far more than its floor. It could grow into the
+// room a newcomer needs, so the newcomer waits, with the figure. Once the
+// resident is held to its limit the room is there.
+func TestPlacementWaitsForAnEngineUnderKVCachedsDefault(t *testing.T) {
+	resident := ledgerClaim("resident", "warm-1", 20*gibibyte, 4*gibibyte)
+	resident.UID = "resident-uid"
+	arriving := claimNeeding("arriving", 20*gibibyte, 4*gibibyte)
+	warm1 := warmPod("warm-1", "b300-pool-a", true, corev1.PodRunning)
+	r, runtime := newReconciler(t, resident, arriving, warm1)
+	runtime.snapshots = map[string]*RuntimeSnapshot{
+		warm1.Status.PodIP: {
+			Accelerators: []RuntimeAcceleratorSnapshot{{
+				ID: "GPU-0", HBMTotalBytes: testHBMTotalBytes, HBMUsableBytes: testUsableBytes,
+			}},
+			Models: []RuntimeSnapshotModel{engineOf(resident, 70*gibibyte, gibibyte)},
+		},
+	}
+
+	reconcileOnce(t, r, "arriving")
+
+	waiting := getModel(t, r, "arriving")
+	assert.Empty(t, waiting.Status.Instances)
+	condition := scheduledCondition(t, waiting)
+	require.NotNil(t, condition)
+	assert.Equal(t, reasonWaitingForRoom, condition.Reason)
+	assert.Contains(t, condition.Message, "the roomiest pod that could hold it, warm-1, can vouch for only")
+
+	runtime.snapshots[warm1.Status.PodIP].Models[0].KVCapacityBytes = 4 * gibibyte
+	reconcileOnce(t, r, "arriving")
+
+	require.Len(t, getModel(t, r, "arriving").Status.Instances, 1)
+}
+
+// TestPlacementWaitsRatherThanGivesUp covers a pool where one card could hold
+// the model once it can show room and another never could. The claim is
+// waiting, not refused, and the refused card is still counted.
+func TestPlacementWaitsRatherThanGivesUp(t *testing.T) {
+	full := ledgerClaim("full", "warm-1", 70*gibibyte, 4*gibibyte)
+	starting := ledgerClaim("starting", "warm-2", 20*gibibyte, 4*gibibyte)
+	starting.Status.Instances[0].Phase = modelv1alpha1.ModelClaimActivating
+	arriving := claimNeeding("arriving", 20*gibibyte, 4*gibibyte)
+	warm1, warm2 := twoWarmPods()
+	r, _ := newReconciler(t, full, starting, arriving, warm1, warm2)
+
+	reconcileOnce(t, r, "arriving")
+
+	condition := scheduledCondition(t, getModel(t, r, "arriving"))
+	require.NotNil(t, condition)
+	assert.Equal(t, reasonWaitingForRoom, condition.Reason)
+	assert.Contains(t, condition.Message, "on warm-2, the engine of starting cannot be read yet")
+	assert.Contains(t, condition.Message, "1 more pod(s) could never hold it")
+}

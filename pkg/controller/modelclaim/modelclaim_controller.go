@@ -73,6 +73,12 @@ const (
 	// NoMatchingPods because the two call for different actions: add capacity
 	// or remove a model, against fix the selector or add pods.
 	reasonInsufficientCapacity = "InsufficientCapacity"
+
+	// reasonWaitingForRoom marks a claim that some warm pod could hold, but
+	// that no warm pod can show room for now, for instance while an engine on
+	// the card is still starting. Unlike InsufficientCapacity, it can clear
+	// with nothing in the ledger changing.
+	reasonWaitingForRoom = "WaitingForRoom"
 )
 
 // ModelClaimReconciler reconciles a ModelClaim object.
@@ -412,15 +418,21 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 	ledgers := r.collectPodLedgers(ctx, pm.Namespace, candidates, placementStates)
 
 	for desiredReplicas(pm) > int32(len(pm.Status.Instances)) {
-		feasible, refusals := filterCandidates(candidates, instancePods(pm), ledgers, minimumReserveBytes)
+		feasible, refusals, waits := filterCandidates(candidates, instancePods(pm), ledgers, minimumReserveBytes)
 		ordered := rankCandidates(feasible, load, servedModelName(pm), r.Locality, placementStates)
 		if len(ordered) == 0 {
 			// No available warm pod right now; remain Pending and retry on requeue.
-			// Being turned down for memory is worth telling apart from matching
-			// no pod at all: one asks for capacity, the other for a different
-			// selector or more pods.
+			// Which of three things is true is worth saying, because each asks
+			// for something different. Some pod could hold the model once it can
+			// show room, which asks for patience. Every pod is provably too full,
+			// which asks for capacity or for a model to leave. Or no pod matched
+			// at all, which asks for a different selector or more pods.
 			reason, message := "NoMatchingPods", "no available candidate warm pod for model"
-			if len(refusals) > 0 {
+			switch {
+			case len(waits) > 0:
+				reason = reasonWaitingForRoom
+				message = summarizeWaits(waits, len(refusals), minimumReserveBytes)
+			case len(refusals) > 0:
 				reason = reasonInsufficientCapacity
 				message = summarizeRefusals(refusals, minimumReserveBytes)
 			}

@@ -243,7 +243,7 @@ func ledgerClaim(name, pod string, footprint, floor int64) *modelv1alpha1.ModelC
 		},
 		Status: modelv1alpha1.ModelClaimStatus{
 			Instances: []modelv1alpha1.ModelClaimInstance{
-				{Pod: pod, Port: 8100, Phase: modelv1alpha1.ModelClaimActive},
+				{Pod: pod, Port: 8100, Phase: modelv1alpha1.ModelClaimActive, KVLimitBytes: floor},
 			},
 		},
 	}
