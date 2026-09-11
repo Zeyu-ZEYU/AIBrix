@@ -14,12 +14,9 @@ NAMESPACE=${NAMESPACE:-zeyu-dev}
 POOL_LABEL=${POOL_LABEL:-pool.aibrix.ai/name=zeyu-pool-a}
 CLAIMS=${CLAIMS:-"gate-a gate-b gate-c"}
 
-# The driver reserve the controller subtracts from a card's total.
-DRIVER_RESERVE_BYTES=268435456
-
 # The fourth column is the pod's GPU count, read from its resources exactly as
-# the controller reads it. A pod with none falls outside the memory gate; a pod
-# with one whose runtime reports no card is a fault, not a CPU-only pod.
+# the controller reads it. A pod with none falls outside the memory gates; a
+# pod with one whose runtime reports no card is a fault, not a CPU-only pod.
 pods() {
   $KUBECTL get pods -n "$NAMESPACE" -l "$POOL_LABEL" -o json | python3 -c '
 import json, sys
@@ -37,6 +34,8 @@ for pod in json.load(sys.stdin)["items"]:
 '
 }
 
+# claim_lines prints each claim's phase, its instances as pod:phase:limit, and
+# the reason on its Scheduled condition.
 claim_lines() {
   $KUBECTL get modelclaims -n "$NAMESPACE" -o json | python3 -c '
 import json, sys
@@ -45,73 +44,127 @@ for claim in json.load(sys.stdin)["items"]:
     status = claim.get("status") or {}
     parts = []
     for instance in status.get("instances", []):
-        parts.append(instance.get("pod", "?") + ":" + instance.get("phase", "?"))
+        limit = instance.get("kvLimitBytes")
+        shown = "%.1fGiB" % (limit / 2 ** 30) if isinstance(limit, int) else "?"
+        parts.append("%s:%s:%s" % (instance.get("pod", "?"), instance.get("phase", "?"), shown))
     where = ",".join(parts) or "-"
     reason = "-"
     for condition in status.get("conditions", []):
         if condition.get("type") == "Scheduled":
             reason = condition.get("reason", "-")
-    phase = status.get("phase", "-")
-    print(f"{name:<10} {phase:<11} {where:<48} {reason}")
+    print("%-10s %-11s %-64s %s" % (name, status.get("phase", "-"), where, reason))
 '
 }
 
-# ledger recomputes what the controller should be seeing, from the same two
-# sources it uses: the runtime snapshot for card size, and claim status plus
-# spec.perGPU for what the card already owes. A disagreement between this and
-# the controller's own condition message is a real finding, not a script bug.
+# ledger recomputes what the controller should be seeing, from the same
+# sources it uses: the runtime snapshot for the card's size and each engine's
+# KV figures, and claim status plus spec.perGPU for what the card owes. A
+# disagreement between this and the controller's own condition message is a
+# real finding, not a script bug.
 ledger() {
-  local claims_json pod ip gpus total snapshot
+  local claims_json pod _ip _phase gpus snapshot
   claims_json=$($KUBECTL get modelclaims -n "$NAMESPACE" -o json)
-  while read -r pod ip _phase gpus; do
+  while read -r pod _ip _phase gpus; do
     [ -z "$pod" ] && continue
     if [ "${gpus:-0}" = "0" ]; then
-      printf '%-42s no GPU allocated, the gate does not apply\n' "$pod"
+      printf '%s: no GPU allocated, the gates do not apply\n' "$pod"
       continue
     fi
     snapshot=$($KUBECTL get --raw "/api/v1/namespaces/$NAMESPACE/pods/$pod:8080/proxy/v1/runtime/snapshot" 2>/dev/null)
     if [ -z "$snapshot" ]; then
-      printf '%-42s snapshot unavailable\n' "$pod"
+      printf '%s: snapshot unavailable, nothing is known about this pod\n' "$pod"
       continue
     fi
-    total=$(printf '%s' "$snapshot" | python3 -c '
-import json, sys
-cards = json.load(sys.stdin).get("accelerators") or []
-print(min((card["hbm_total_bytes"] for card in cards), default=0))
-')
-    printf '%s' "$claims_json" | POD="$pod" TOTAL="$total" RESERVE="$DRIVER_RESERVE_BYTES" python3 -c '
+    printf '%s' "$snapshot" | CLAIMS_JSON="$claims_json" POD="$pod" python3 -c '
 import json, os, sys
+
+GIB = 2 ** 30
 pod = os.environ["POD"]
-total = int(os.environ["TOTAL"])
-reserve = int(os.environ["RESERVE"])
-usable = total - reserve if total > reserve else 0
-charged = 0
+snapshot = json.load(sys.stdin)
+claims = json.loads(os.environ["CLAIMS_JSON"])["items"]
+cards = snapshot.get("accelerators") or []
+usable = min((card.get("hbm_usable_bytes", 0) for card in cards), default=0)
+if usable <= 0:
+    print("%s: the runtime could not size this card (hbm_usable_bytes %d)" % (pod, usable))
+    sys.exit(0)
+engines = snapshot.get("models") or []
+
+
+def gib(value):
+    return "%.2fGiB" % (value / GIB)
+
+
+# The engine a claim owns: by claim UID when the runtime reports one, else by
+# served name, the way the controller matches them.
+def engine_for(claim):
+    uid = claim["metadata"].get("uid", "")
+    served = (claim.get("spec") or {}).get("modelName") or claim["metadata"]["name"]
+    legacy = None
+    for index, engine in enumerate(engines):
+        ref = engine.get("claim_ref") or {}
+        if uid and ref.get("uid"):
+            if ref["uid"] == uid:
+                return index
+            continue
+        if engine.get("model_name") == served:
+            legacy = index
+    return legacy
+
+
+# An engine counts only while its process is alive and it is ready or asleep,
+# and only when its segment exists.
+def readable(engine):
+    if engine is None or not engine.get("alive"):
+        return False
+    if not (engine.get("ready") or engine.get("phase") == "sleeping"):
+        return False
+    return engine.get("kv_capacity_bytes", -1) >= 0 and engine.get("kv_used_bytes", -1) >= 0
+
+
+floors = 0
+bounds = 0
+unreadable = None
+claimed = set()
 lines = []
-blind = None
-for claim in json.load(sys.stdin)["items"]:
+for claim in claims:
     name = claim["metadata"]["name"]
     per = (claim.get("spec") or {}).get("perGPU") or {}
-    footprint = per.get("maximumFootprintBytes")
-    floor = per.get("kvFloorBytes")
+    footprint = per.get("maximumFootprintBytes", 0)
+    floor = per.get("kvFloorBytes", 0)
     for instance in (claim.get("status") or {}).get("instances", []):
         if instance.get("pod") != pod or instance.get("phase") == "Failed":
             continue
-        if not footprint or not floor:
-            blind = blind or name
-            continue
-        charged += footprint + floor
-        size = (footprint + floor) / 2**30
-        lines.append(f"{name}={size:.0f}GiB")
-if total == 0:
-    print(f"{pod:<42} has a GPU but the runtime reported no usable card: refused")
-elif blind:
-    print(f"{pod:<42} unreadable: {blind} declares no perGPU")
+        limit = instance.get("kvLimitBytes", 0)
+        index = engine_for(claim)
+        engine = engines[index] if index is not None else None
+        if index is not None:
+            claimed.add(index)
+        floors += footprint + floor
+        if readable(engine):
+            capacity = engine["kv_capacity_bytes"]
+            used = engine["kv_used_bytes"]
+            bound = max(limit, capacity, used)
+            bounds += footprint + bound
+            state = "in force" if capacity == limit else "NOT in force"
+            lines.append("  %-8s limit %s  segment %s  mapped %s  upper bound %s  (%s)" % (
+                name, gib(limit), gib(capacity), gib(used), gib(bound), state))
+        else:
+            unreadable = unreadable or name
+            phase = engine.get("phase", "?") if engine else "not in the snapshot"
+            lines.append("  %-8s limit %s  engine %s, not readable" % (name, gib(limit), phase))
+
+strangers = [engine.get("model_name", "?") for index, engine in enumerate(engines)
+             if engine.get("alive") and index not in claimed]
+summary = "%s: usable %s  maximumRoom %s" % (pod, gib(usable), gib(usable - floors))
+if strangers:
+    summary += "  minimumRoom unknown: the runtime reports engines no claim accounts for: " + ", ".join(strangers)
+elif unreadable:
+    summary += "  minimumRoom unknown: the engine of %s cannot be read yet" % unreadable
 else:
-    detail = " [" + ", ".join(lines) + "]" if lines else ""
-    u = usable / 2**30
-    c = charged / 2**30
-    room = (usable - charged) / 2**30
-    print(f"{pod:<42} usable {u:.2f}GiB  charged {c:.2f}GiB  maximumRoom {room:.2f}GiB{detail}")
+    summary += "  minimumRoom " + gib(usable - bounds)
+print(summary)
+for line in lines:
+    print(line)
 '
   done < <(pods)
 }
@@ -127,14 +180,15 @@ for claim in json.load(sys.stdin)["items"]:
     print("--- " + name)
     for condition in (claim.get("status") or {}).get("conditions", []):
         if condition.get("type") == "Scheduled":
-            print("    " + condition.get("reason", "-") + ": " + condition.get("message", ""))
+            print("    %s %s: %s" % (condition.get("status", "-"), condition.get("reason", "-"), condition.get("message", "")))
 '
 }
 
 events() {
   $KUBECTL get events -n "$NAMESPACE" -o json | python3 -c '
 import json, sys
-interesting = ("Placement", "Ledger", "Numbers", "Capacity", "Activating", "NoMatching")
+interesting = ("Capacity", "WaitingForRoom", "NoMatching", "Activating", "Activated",
+               "KVLimit", "Unhealthy", "EngineFailed")
 rows = []
 for event in json.load(sys.stdin)["items"]:
     reason = event.get("reason", "")
@@ -143,8 +197,8 @@ for event in json.load(sys.stdin)["items"]:
     stamp = event.get("lastTimestamp") or event.get("eventTime") or ""
     obj = event.get("involvedObject") or {}
     rows.append((stamp, event.get("count", 1), reason, obj.get("name", ""), event.get("message", "")))
-for stamp, count, reason, name, message in sorted(rows)[-15:]:
-    print(f"{stamp}  x{count:<3} {reason:<22} {name:<10} {message}")
+for stamp, count, reason, name, message in sorted(rows)[-20:]:
+    print("%s  x%-3s %-22s %-8s %s" % (stamp, count, reason, name, message))
 '
 }
 

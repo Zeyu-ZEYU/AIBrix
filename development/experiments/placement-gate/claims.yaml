@@ -1,9 +1,9 @@
-# Two ModelClaims sized so that the first fills the pool's single card and the
-# second cannot be placed on it. See README.md for how the numbers were chosen.
+# Two ModelClaims that fit the pool's single card together by their floors.
+# See README.md for how the numbers were chosen.
 #
 # The declared cost is deliberately far above what this model really uses. The
-# gate judges the declaration, so overstating it produces a full card on demand,
-# while the engine itself stays small enough to start and serve normally.
+# gates judge the declaration, so overstating it fills the card on demand,
+# while the engines themselves stay small enough to start and serve normally.
 apiVersion: model.aibrix.ai/v1alpha1
 kind: ModelClaim
 metadata:
@@ -18,7 +18,7 @@ spec:
   engine: vllm
   replicas: 1
   perGPU:
-    maximumFootprintBytes: 53687091200  # 50 GiB
+    maximumFootprintBytes: 32212254720  # 30 GiB
     kvFloorBytes: 10737418240           # 10 GiB
   engineConfig:
     args:
@@ -38,7 +38,7 @@ spec:
   engine: vllm
   replicas: 1
   perGPU:
-    maximumFootprintBytes: 53687091200  # 50 GiB
+    maximumFootprintBytes: 32212254720  # 30 GiB
     kvFloorBytes: 10737418240           # 10 GiB
   engineConfig:
     args:

@@ -1,0 +1,21 @@
+# A third ModelClaim of the same size. Once gate-a and gate-b are on the card,
+# no card could ever hold it. See README.md.
+apiVersion: model.aibrix.ai/v1alpha1
+kind: ModelClaim
+metadata:
+  name: gate-c
+  namespace: zeyu-dev
+spec:
+  modelName: gate-c
+  podSelector:
+    matchLabels:
+      pool.aibrix.ai/name: zeyu-pool-a
+  artifactURL: /models/DeepSeek-R1-Distill-Qwen-1.5B
+  engine: vllm
+  replicas: 1
+  perGPU:
+    maximumFootprintBytes: 32212254720  # 30 GiB
+    kvFloorBytes: 10737418240           # 10 GiB
+  engineConfig:
+    args:
+      --max-model-len: "2048"
