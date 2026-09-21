@@ -608,6 +608,11 @@ Claim remains ``Pending`` with ``NoMatchingPods`` about GPU memory
    requirement still runs on it, or when an engine there belongs to no claim on
    it.
 
+   The Event also says how long until the next attempt. That wait doubles with
+   each refusal in a row, up to a minute, so a model waiting on hardware that
+   has not arrived does not poll the pool. Adding a card brings the claim in
+   within a minute; nothing needs to be restarted.
+
 Claim remains ``Activating``
    Inspect the runtime snapshot and engine logs. Weight download, CUDA graph
    initialization, or engine compilation may take time. The controller
