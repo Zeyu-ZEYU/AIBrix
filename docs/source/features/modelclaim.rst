@@ -247,11 +247,11 @@ The supported spec fields are:
      - Engine CLI flags mapped to string values. Use an empty string for a
        boolean flag.
    * - ``perGPU.maximumFootprintBytes``
-     - No
+     - Yes
      - The largest non-KV GPU memory one instance holds on a device: weights,
        captured CUDA graphs, activation workspaces and allocator retention.
    * - ``perGPU.kvFloorBytes``
-     - No
+     - Yes
      - The KV cache one instance must keep on a device to serve at all.
 
 For example:
@@ -341,11 +341,16 @@ Watch the arrangement through its Events:
 The automatic pool policy below stands down on these Pods. Two writers on one
 KV allocator would only overwrite each other.
 
-A claim that omits ``perGPU`` is placed exactly as before, without the check,
-and its engine is not held to a limit.
-Declare it on every claim in a pool, or on none: a single undeclared instance
-leaves that card unaccountable, and claims that do declare are then placed
-elsewhere.
+``perGPU`` is required, and a claim without it is rejected at ``kubectl
+apply``. Nothing could be put there in its place: what an engine holds beyond
+its weights does not follow from the artifact, so a claim that does not say is
+a card nobody can account for. One such claim makes its whole card unusable to
+every other model, which is a worse way to find out than an error at
+admission.
+
+A claim stored before this became required still decodes, and its missing
+declaration still reads as missing. The card it runs on is left unaccountable
+until the claim is replaced.
 
 Configure TP and PP pools
 -------------------------
@@ -467,9 +472,9 @@ pool Deployment. It does not add fields to ModelClaim.
    ``reclaim`` is superseded by ``spec.perGPU`` and will be removed. Its
    ``capacityBytes`` is a figure an operator types in, unrelated to what the
    card actually holds, so a pool configured this way can be both wrong and
-   confident. A claim that declares ``perGPU`` has its card measured and
-   divided instead, and the policy stands down on those Pods. Declare
-   ``perGPU`` on new claims. ``lifecycle`` is not affected.
+   confident. A claim declares ``perGPU`` instead, which has its card measured
+   and divided, and the policy stands down on those Pods. ``lifecycle`` is not
+   affected.
 
 .. code-block:: bash
 
@@ -500,8 +505,8 @@ OOM guarantee.
 
 The policy leaves a Pod alone when an instance recorded on it already runs
 under a KV limit of its own, which is the case for every claim that declares
-``perGPU``. Until ``reclaim`` is removed, this annotation is for pools whose
-claims declare no per-GPU cost.
+``perGPU``, which every claim now does. Until ``reclaim`` is removed, this
+annotation reaches only claims stored before that requirement.
 
 The JSON parser rejects unknown fields. An invalid policy is disabled and
 reported with an ``InvalidPoolPolicy`` Event:
@@ -592,8 +597,9 @@ Claim remains ``Pending`` with ``NoMatchingPods`` about GPU memory
    smallest gap to close, and says which count it failed: a card that could
    never hold the model, or one whose room is held by the engines already on
    it. A Pod is also turned away when its runtime did not answer, when one of
-   its cards could not be measured, when a claim without ``perGPU`` already
-   runs on it, or when an engine there belongs to no claim on it.
+   its cards could not be measured, when a claim predating the ``perGPU``
+   requirement still runs on it, or when an engine there belongs to no claim on
+   it.
 
    The Event also says how long until the next attempt. That wait doubles with
    each refusal in a row, up to a minute, so a model waiting on hardware that
