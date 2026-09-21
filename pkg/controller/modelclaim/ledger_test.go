@@ -52,16 +52,35 @@ func claimOnPod(name, pod string, phase modelv1alpha1.ModelClaimPhase, footprint
 	return claim
 }
 
-func sizedPodStates(pod string, usableBytes int64) map[string]PodPlacementState {
-	return map[string]PodPlacementState{
-		pod: {SnapshotKnown: true, HBMUsableBytes: usableBytes, HBMUsableKnown: true},
+// sizedPodSnapshots is what one measurable card reports, with the engines
+// given running on it.
+func sizedPodSnapshots(pod string, usableBytes int64, models ...RuntimeSnapshotModel) map[string]*RuntimeSnapshot {
+	return map[string]*RuntimeSnapshot{
+		pod: {
+			Accelerators: []RuntimeAcceleratorSnapshot{{ID: "GPU-0", HBMUsableBytes: usableBytes}},
+			Models:       models,
+		},
 	}
 }
 
-func ledgerFor(t *testing.T, pod *corev1.Pod, states map[string]PodPlacementState, claims ...client.Object) podLedger {
+// engineHolding is one engine in a snapshot, serving the claim of the same name
+// and holding the given KV.
+func engineHolding(model string, kvUsedBytes, kvCapacityBytes int64) RuntimeSnapshotModel {
+	return RuntimeSnapshotModel{
+		ModelName:       model,
+		Port:            9001,
+		Phase:           "active",
+		Alive:           true,
+		Ready:           true,
+		KVUsedBytes:     kvUsedBytes,
+		KVCapacityBytes: kvCapacityBytes,
+	}
+}
+
+func ledgerFor(t *testing.T, pod *corev1.Pod, snapshots map[string]*RuntimeSnapshot, claims ...client.Object) podLedger {
 	t.Helper()
 	r, _ := newReconciler(t, append(claims, pod)...)
-	ledgers := r.collectPodLedgers(context.Background(), testNamespace, []corev1.Pod{*pod}, states)
+	ledgers := r.collectPodLedgers(context.Background(), testNamespace, []corev1.Pod{*pod}, snapshots)
 	ledger, found := ledgers[pod.Name]
 	require.True(t, found)
 	return ledger
@@ -69,7 +88,7 @@ func ledgerFor(t *testing.T, pod *corev1.Pod, states map[string]PodPlacementStat
 
 func TestLedgerChargesEveryInstanceButFailedOnes(t *testing.T) {
 	pod := warmPodWithGPUs("warm-1", "b300-pool-a", 1)
-	ledger := ledgerFor(t, pod, sizedPodStates(pod.Name, 1000),
+	ledger := ledgerFor(t, pod, sizedPodSnapshots(pod.Name, 1000),
 		claimOnPod("active", pod.Name, modelv1alpha1.ModelClaimActive, 300, 100),
 		claimOnPod("activating", pod.Name, modelv1alpha1.ModelClaimActivating, 200, 50),
 		claimOnPod("failed", pod.Name, modelv1alpha1.ModelClaimFailed, 400, 100),
@@ -82,7 +101,7 @@ func TestLedgerChargesEveryInstanceButFailedOnes(t *testing.T) {
 
 func TestLedgerIgnoresInstancesOnOtherPods(t *testing.T) {
 	pod := warmPodWithGPUs("warm-1", "b300-pool-a", 1)
-	ledger := ledgerFor(t, pod, sizedPodStates(pod.Name, 1000),
+	ledger := ledgerFor(t, pod, sizedPodSnapshots(pod.Name, 1000),
 		claimOnPod("elsewhere", "warm-2", modelv1alpha1.ModelClaimActive, 300, 100),
 	)
 
@@ -94,7 +113,7 @@ func TestLedgerIgnoresInstancesOnOtherPods(t *testing.T) {
 func TestLedgerHasAHoleWhenTheRuntimeDidNotAnswer(t *testing.T) {
 	pod := warmPodWithGPUs("warm-1", "b300-pool-a", 1)
 
-	ledger := ledgerFor(t, pod, map[string]PodPlacementState{})
+	ledger := ledgerFor(t, pod, map[string]*RuntimeSnapshot{})
 
 	assert.False(t, ledger.judgeable)
 	assert.Equal(t, "its runtime did not answer", ledger.blocked)
@@ -102,11 +121,11 @@ func TestLedgerHasAHoleWhenTheRuntimeDidNotAnswer(t *testing.T) {
 
 func TestLedgerHasAHoleWhenACardCouldNotBeMeasured(t *testing.T) {
 	pod := warmPodWithGPUs("warm-1", "b300-pool-a", 1)
-	states := map[string]PodPlacementState{
-		pod.Name: {SnapshotKnown: true, HBMUsableKnown: false},
+	snapshots := map[string]*RuntimeSnapshot{
+		pod.Name: {Accelerators: []RuntimeAcceleratorSnapshot{{ID: "GPU-0", HBMUsableBytes: -1}}},
 	}
 
-	ledger := ledgerFor(t, pod, states)
+	ledger := ledgerFor(t, pod, snapshots)
 
 	assert.False(t, ledger.judgeable)
 	assert.Equal(t, "its cards could not be measured", ledger.blocked)
@@ -120,7 +139,7 @@ func TestLedgerHasAHoleWhenAnInstanceDeclaresNoCost(t *testing.T) {
 		{Pod: pod.Name, Phase: modelv1alpha1.ModelClaimActive},
 	}
 
-	ledger := ledgerFor(t, pod, sizedPodStates(pod.Name, 1000),
+	ledger := ledgerFor(t, pod, sizedPodSnapshots(pod.Name, 1000),
 		claimOnPod("declared", pod.Name, modelv1alpha1.ModelClaimActive, 300, 100),
 		undeclared,
 	)
@@ -128,4 +147,56 @@ func TestLedgerHasAHoleWhenAnInstanceDeclaresNoCost(t *testing.T) {
 	assert.False(t, ledger.judgeable)
 	assert.Equal(t, "legacy runs there and declares no per-GPU cost", ledger.blocked)
 	assert.Equal(t, int64(400), ledger.owedBytes)
+}
+
+func TestLedgerHoldsWhatEachEngineHasMapped(t *testing.T) {
+	pod := warmPodWithGPUs("warm-1", "b300-pool-a", 1)
+	// The engine mapped 250 where its claim declared a floor of 100, so it
+	// holds 150 more than the account alone would show.
+	ledger := ledgerFor(t, pod,
+		sizedPodSnapshots(pod.Name, 1000, engineHolding("grown", 250, 400)),
+		claimOnPod("grown", pod.Name, modelv1alpha1.ModelClaimActive, 300, 100),
+	)
+
+	assert.True(t, ledger.judgeable)
+	assert.Equal(t, int64(600), ledger.maximumRoomBytes())
+	assert.Equal(t, int64(450), ledger.heldRoomBytes())
+	require.Len(t, ledger.engines, 1)
+	assert.Equal(t, int64(250), ledger.engines[0].kvHeldBytes())
+	assert.Equal(t, int64(400), ledger.engines[0].kvCapacityBytes)
+}
+
+func TestLedgerHoldsTheDeclaredFloorForAnEngineThatHasNotStarted(t *testing.T) {
+	pod := warmPodWithGPUs("warm-1", "b300-pool-a", 1)
+	ledger := ledgerFor(t, pod, sizedPodSnapshots(pod.Name, 1000),
+		claimOnPod("booting", pod.Name, modelv1alpha1.ModelClaimActivating, 300, 100),
+	)
+
+	assert.True(t, ledger.judgeable)
+	assert.Equal(t, int64(600), ledger.heldRoomBytes())
+	require.Len(t, ledger.engines, 1)
+	assert.Equal(t, int64(100), ledger.engines[0].kvHeldBytes())
+	assert.Equal(t, kvLimitUnknown, ledger.engines[0].kvCapacityBytes)
+}
+
+func TestLedgerChargesAFailedInstanceWhoseEngineIsStillThere(t *testing.T) {
+	pod := warmPodWithGPUs("warm-1", "b300-pool-a", 1)
+	ledger := ledgerFor(t, pod,
+		sizedPodSnapshots(pod.Name, 1000, engineHolding("failed", 250, 400)),
+		claimOnPod("failed", pod.Name, modelv1alpha1.ModelClaimFailed, 300, 100),
+	)
+
+	assert.True(t, ledger.judgeable)
+	assert.Equal(t, int64(450), ledger.heldRoomBytes())
+}
+
+func TestLedgerHasAHoleWhenAnEngineBelongsToNoClaimOnTheCard(t *testing.T) {
+	pod := warmPodWithGPUs("warm-1", "b300-pool-a", 1)
+	ledger := ledgerFor(t, pod,
+		sizedPodSnapshots(pod.Name, 1000, engineHolding("stranger", 250, 400)),
+		claimOnPod("declared", pod.Name, modelv1alpha1.ModelClaimActive, 300, 100),
+	)
+
+	assert.False(t, ledger.judgeable)
+	assert.Equal(t, "the engine serving stranger there belongs to no claim on it", ledger.blocked)
 }

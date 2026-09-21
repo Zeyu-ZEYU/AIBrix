@@ -403,9 +403,10 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 	// A claim that declares what it costs is only placed where the card's
 	// account can show the room. One that declares nothing is placed as before.
 	admissible, refusals := candidates, []podRefusal(nil)
+	ledgers := map[string]podLedger(nil)
 	needBytes := minimumReserveBytes(pm)
 	if needBytes > 0 {
-		ledgers := r.collectPodLedgers(ctx, pm.Namespace, candidates, placementStates)
+		ledgers = r.collectPodLedgers(ctx, pm.Namespace, candidates, r.freshSnapshots(ctx, candidates))
 		admissible, refusals = admissibleCandidates(candidates, ledgers, needBytes)
 	}
 
@@ -487,6 +488,29 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 			"model %s engine starting on pod %s:%d", servedModelName(pm), pod.Name, resp.Port)
 	}
 	return nil
+}
+
+// freshSnapshots reads every candidate's runtime directly, going around the
+// snapshot cache. Ranking can work from a reading a few seconds old, and an
+// account cannot: what an engine holds moves with traffic, and a model admitted
+// against memory another engine has since mapped is how a card ends up
+// oversubscribed. A pod whose runtime did not answer is simply absent.
+func (r *ModelClaimReconciler) freshSnapshots(
+	ctx context.Context,
+	candidates []corev1.Pod,
+) map[string]*RuntimeSnapshot {
+	snapshots := make(map[string]*RuntimeSnapshot, len(candidates))
+	for i := range candidates {
+		pod := &candidates[i]
+		snapshot, err := r.Runtime.Snapshot(ctx, pod.Status.PodIP, DefaultRuntimePort)
+		if err != nil || snapshot == nil {
+			klog.V(4).InfoS("placement could not read a runtime",
+				"pod", klog.KObj(pod), "err", err)
+			continue
+		}
+		snapshots[pod.Name] = snapshot
+	}
+	return snapshots
 }
 
 func (r *ModelClaimReconciler) collectPlacementStates(

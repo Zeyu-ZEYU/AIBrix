@@ -166,6 +166,10 @@ func (f *fakeRuntime) Snapshot(_ context.Context, podIP string, _ int) (*Runtime
 			Phase:     model.Phase,
 			Alive:     model.Phase != "failed",
 			Ready:     ready,
+			// This fake starts engines, and does not model a KV allocator. A
+			// test that wants one seeds the model in f.snapshots instead.
+			KVUsedBytes:     kvLimitUnknown,
+			KVCapacityBytes: kvLimitUnknown,
 		})
 	}
 	return result, nil
@@ -1224,6 +1228,27 @@ func TestReconcileRefusesACardWithoutRoomForTheDeclaredCost(t *testing.T) {
 	assert.Contains(t, cond.Message, "warm-1 can offer at most")
 }
 
+func TestReconcileRefusesACardWhoseRoomIsHeldByTheEnginesOnIt(t *testing.T) {
+	pm := claimWithCost(300, 100)
+	pod, snapshot := sizedWarmPod("warm-1", "10.0.0.1", 1000)
+	// The card could hold this model once the neighbour is back at its floor,
+	// and the neighbour has mapped 500.
+	neighbour := claimOnPod("neighbour", pod.Name, modelv1alpha1.ModelClaimActive, 300, 100)
+	snapshot.Models = []RuntimeSnapshotModel{engineHolding("neighbour", 500, 600)}
+	r, runtime := newReconciler(t, pm, pod, neighbour)
+	runtime.snapshots = map[string]*RuntimeSnapshot{pod.Status.PodIP: snapshot}
+
+	reconcileOnce(t, r, pm.Name)
+
+	assert.Empty(t, runtime.activateCalls)
+	got := getModel(t, r, pm.Name)
+	assert.Empty(t, got.Status.Instances)
+	cond := meta.FindStatusCondition(got.Status.Conditions,
+		string(modelv1alpha1.ModelClaimConditionTypeScheduled))
+	require.NotNil(t, cond)
+	assert.Contains(t, cond.Message, "held by the engines already on it")
+}
+
 func TestReconcilePlacesOnTheCardThatCanHoldTheDeclaredCost(t *testing.T) {
 	pm := claimWithCost(700, 100)
 	full, fullSnapshot := sizedWarmPod("warm-full", "10.0.0.1", 1000)
@@ -1284,17 +1309,22 @@ func readyEngine(kvCapacityBytes int64) RuntimeSnapshotModel {
 func TestReconcileHoldsAnEngineToItsLimitBeforeRouting(t *testing.T) {
 	pm := claimWithCost(700, 100)
 	pod, snapshot := sizedWarmPod("warm-1", "10.0.0.1", 1000)
-	snapshot.Models = []RuntimeSnapshotModel{readyEngine(5000)}
 	r, runtime := newReconciler(t, pm, pod)
 	runtime.snapshots = map[string]*RuntimeSnapshot{pod.Status.PodIP: snapshot}
 
 	reconcileOnce(t, r, pm.Name)
 
-	require.Len(t, runtime.kvLimitCalls, 1)
-	assert.Equal(t, int64(100), runtime.kvLimitCalls[0].LimitBytes)
 	got := getModel(t, r, pm.Name)
 	require.Len(t, got.Status.Instances, 1)
 	assert.Equal(t, int64(100), got.Status.Instances[0].KVLimitBytes)
+
+	// The engine comes up under its allocator's own limit.
+	snapshot.Models = []RuntimeSnapshotModel{readyEngine(5000)}
+	reconcileOnce(t, r, pm.Name)
+
+	require.Len(t, runtime.kvLimitCalls, 1)
+	assert.Equal(t, int64(100), runtime.kvLimitCalls[0].LimitBytes)
+	got = getModel(t, r, pm.Name)
 	assert.Equal(t, modelv1alpha1.ModelClaimActivating, got.Status.Instances[0].Phase)
 	assert.Equal(t, int32(0), got.Status.ReadyReplicas)
 
@@ -1332,10 +1362,12 @@ func TestReconcileKeepsAnActiveEngineRoutableWhileItsLimitIsWrittenAgain(t *test
 func TestReconcileWritesNoLimitIntoAnEngineWithoutASegment(t *testing.T) {
 	pm := claimWithCost(700, 100)
 	pod, snapshot := sizedWarmPod("warm-1", "10.0.0.1", 1000)
-	snapshot.Models = []RuntimeSnapshotModel{readyEngine(-1)}
 	r, runtime := newReconciler(t, pm, pod)
 	runtime.snapshots = map[string]*RuntimeSnapshot{pod.Status.PodIP: snapshot}
 
+	reconcileOnce(t, r, pm.Name)
+
+	snapshot.Models = []RuntimeSnapshotModel{readyEngine(-1)}
 	reconcileOnce(t, r, pm.Name)
 
 	assert.Empty(t, runtime.kvLimitCalls)
