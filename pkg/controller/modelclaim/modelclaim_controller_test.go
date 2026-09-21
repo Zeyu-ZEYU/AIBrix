@@ -263,6 +263,7 @@ func newReconciler(t *testing.T, objs ...client.Object) (*ModelClaimReconciler, 
 		Recorder:   record.NewFakeRecorder(32),
 		Runtime:    runtime,
 		PoolPolicy: newPoolPolicyManager(time.Now),
+		Backoff:    newPlacementBackoff(time.Now),
 		SnapshotCache: newRuntimeSnapshotCache(
 			defaultRuntimeSnapshotTTL, time.Now,
 		),
@@ -1258,7 +1259,9 @@ func TestReconcileStopsSayingNoCardWillTakeItOnceOneDoes(t *testing.T) {
 	pm := claimWithCost(700, 100)
 	small, smallSnapshot := sizedWarmPod("warm-small", "10.0.0.1", 500)
 	roomy, roomySnapshot := sizedWarmPod("warm-roomy", "10.0.0.2", 2000)
+	now := time.Unix(1_700_000_000, 0)
 	r, runtime := newReconciler(t, pm, small)
+	r.Backoff = newPlacementBackoff(func() time.Time { return now })
 	runtime.snapshots = map[string]*RuntimeSnapshot{
 		small.Status.PodIP: smallSnapshot,
 		roomy.Status.PodIP: roomySnapshot,
@@ -1271,9 +1274,10 @@ func TestReconcileStopsSayingNoCardWillTakeItOnceOneDoes(t *testing.T) {
 	require.NotNil(t, cond)
 	assert.Equal(t, metav1.ConditionFalse, cond.Status)
 
-	// A card with room joins the pool. The earlier refusal must not be left
-	// standing as the claim's answer about finding one.
+	// A card with room joins the pool, and the wait is up. The earlier refusal
+	// must not be left standing as the claim's answer about finding one.
 	require.NoError(t, r.Create(context.Background(), roomy))
+	now = now.Add(DefaultRequeueDuration)
 	reconcileOnce(t, r, pm.Name)
 
 	require.Len(t, runtime.activateCalls, 1)
@@ -1327,6 +1331,68 @@ func TestReconcileRefusesACardRunningAnEngineNoClaimAnswersFor(t *testing.T) {
 	require.NotNil(t, cond)
 	assert.Equal(t, metav1.ConditionFalse, cond.Status)
 	assert.Contains(t, cond.Message, "answers to no claim")
+}
+
+func TestReconcileBacksOffWhenNoCardCanHoldTheModel(t *testing.T) {
+	pm := claimWithCost(700, 100)
+	pod, snapshot := sizedWarmPod("warm-1", "10.0.0.1", 500)
+	now := time.Unix(1_700_000_000, 0)
+	r, runtime := newReconciler(t, pm, pod)
+	r.Backoff = newPlacementBackoff(func() time.Time { return now })
+	runtime.snapshots = map[string]*RuntimeSnapshot{pod.Status.PodIP: snapshot}
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: testNamespace, Name: pm.Name},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, DefaultRequeueDuration, result.RequeueAfter)
+	asked := runtime.snapshotCalls
+	require.NotZero(t, asked)
+
+	// Still inside the wait: the pool is not asked about it again.
+	result, err = r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: testNamespace, Name: pm.Name},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, DefaultRequeueDuration, result.RequeueAfter)
+	assert.Equal(t, asked, runtime.snapshotCalls)
+
+	// Once the wait is up it tries again, and waits twice as long.
+	now = now.Add(DefaultRequeueDuration)
+	result, err = r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: testNamespace, Name: pm.Name},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 2*DefaultRequeueDuration, result.RequeueAfter)
+	assert.Greater(t, runtime.snapshotCalls, asked)
+}
+
+func TestReconcileStopsWaitingOnceTheModelIsPlaced(t *testing.T) {
+	pm := claimWithCost(700, 100)
+	small, smallSnapshot := sizedWarmPod("warm-small", "10.0.0.1", 500)
+	roomy, roomySnapshot := sizedWarmPod("warm-roomy", "10.0.0.2", 2000)
+	now := time.Unix(1_700_000_000, 0)
+	r, runtime := newReconciler(t, pm, small)
+	r.Backoff = newPlacementBackoff(func() time.Time { return now })
+	runtime.snapshots = map[string]*RuntimeSnapshot{
+		small.Status.PodIP: smallSnapshot,
+		roomy.Status.PodIP: roomySnapshot,
+	}
+	claim := types.NamespacedName{Namespace: testNamespace, Name: pm.Name}
+
+	reconcileOnce(t, r, pm.Name)
+	due, _ := r.Backoff.due(claim)
+	assert.False(t, due)
+
+	// A card with room joins the pool, and the wait is up.
+	require.NoError(t, r.Create(context.Background(), roomy))
+	now = now.Add(DefaultRequeueDuration)
+	reconcileOnce(t, r, pm.Name)
+
+	require.Len(t, runtime.activateCalls, 1)
+	// The count of refusals in a row is back to none, so a claim that has to
+	// wait again starts from the shortest wait rather than the longest.
+	assert.Equal(t, DefaultRequeueDuration, r.Backoff.refused(claim))
 }
 
 func TestReconcilePlacesOnTheCardThatCanHoldTheDeclaredCost(t *testing.T) {
