@@ -1,0 +1,21 @@
+# A third ModelClaim of the same size. Once gate-a and gate-b are on the card,
+# no card could ever hold it. See README.md.
+apiVersion: model.aibrix.ai/v1alpha1
+kind: ModelClaim
+metadata:
+  name: gate-c
+  namespace: default
+spec:
+  modelName: gate-c
+  podSelector:
+    matchLabels:
+      pool.aibrix.ai/name: b300-pool-a
+  artifactURL: /models/DeepSeek-R1-Distill-Qwen-1.5B
+  engine: vllm
+  replicas: 1
+  perGPU:
+    maximumFootprint: 30Gi
+    kvFloor: 10Gi
+  engineConfig:
+    args:
+      --max-model-len: "2048"
