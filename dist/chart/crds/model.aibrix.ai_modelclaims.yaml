@@ -161,6 +161,9 @@ spec:
               instances:
                 items:
                   properties:
+                    kvLimitBytes:
+                      format: int64
+                      type: integer
                     phase:
                       type: string
                     pod:
