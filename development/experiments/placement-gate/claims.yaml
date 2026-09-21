@@ -1,0 +1,45 @@
+# Two ModelClaims that fit the pool's single card together by their floors.
+# See README.md for how the numbers were chosen.
+#
+# The declared cost is deliberately far above what this model really uses. The
+# gates judge the declaration, so overstating it fills the card on demand,
+# while the engines themselves stay small enough to start and serve normally.
+apiVersion: model.aibrix.ai/v1alpha1
+kind: ModelClaim
+metadata:
+  name: gate-a
+  namespace: default
+spec:
+  modelName: gate-a
+  podSelector:
+    matchLabels:
+      pool.aibrix.ai/name: b300-pool-a
+  artifactURL: /models/DeepSeek-R1-Distill-Qwen-1.5B
+  engine: vllm
+  replicas: 1
+  perGPU:
+    maximumFootprintBytes: 32212254720  # 30 GiB
+    kvFloorBytes: 10737418240           # 10 GiB
+  engineConfig:
+    args:
+      --max-model-len: "2048"
+---
+apiVersion: model.aibrix.ai/v1alpha1
+kind: ModelClaim
+metadata:
+  name: gate-b
+  namespace: default
+spec:
+  modelName: gate-b
+  podSelector:
+    matchLabels:
+      pool.aibrix.ai/name: b300-pool-a
+  artifactURL: /models/DeepSeek-R1-Distill-Qwen-1.5B
+  engine: vllm
+  replicas: 1
+  perGPU:
+    maximumFootprintBytes: 32212254720  # 30 GiB
+    kvFloorBytes: 10737418240           # 10 GiB
+  engineConfig:
+    args:
+      --max-model-len: "2048"
