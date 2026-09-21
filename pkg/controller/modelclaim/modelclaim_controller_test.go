@@ -1335,6 +1335,14 @@ func TestReconcileStopsWaitingOnceTheModelIsPlaced(t *testing.T) {
 	// The count of refusals in a row is back to none, so a claim that has to
 	// wait again starts from the shortest wait rather than the longest.
 	assert.Equal(t, DefaultRequeueDuration, r.Backoff.refused(claim))
+
+	// The refusal is no longer the claim's answer about finding a card.
+	cond := meta.FindStatusCondition(getModel(t, r, pm.Name).Status.Conditions,
+		string(modelv1alpha1.ModelClaimConditionTypeScheduled))
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
+	assert.Equal(t, "Placed", cond.Reason)
+	assert.Contains(t, cond.Message, roomy.Name)
 }
 
 func TestReconcilePlacesOnTheCardThatCanHoldTheDeclaredCost(t *testing.T) {
