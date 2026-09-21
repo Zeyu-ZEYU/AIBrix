@@ -39,6 +39,15 @@ func minimumReserveBytes(pm *modelv1alpha1.ModelClaim) int64 {
 	return pm.Spec.PerGPU.MaximumFootprintBytes + pm.Spec.PerGPU.KVFloorBytes
 }
 
+// kvFloorBytes is the KV cache a claim declared one instance must keep on a
+// card, and zero for a claim that declares nothing.
+func kvFloorBytes(pm *modelv1alpha1.ModelClaim) int64 {
+	if pm == nil || pm.Spec.PerGPU == nil {
+		return 0
+	}
+	return pm.Spec.PerGPU.KVFloorBytes
+}
+
 // podLedger is one card's account: how much it can hold, and how much of it the
 // instances already recorded there were promised.
 //
