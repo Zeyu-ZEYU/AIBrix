@@ -272,6 +272,7 @@ func newReconciler(t *testing.T, objs ...client.Object) (*ModelClaimReconciler, 
 		SnapshotCache: newRuntimeSnapshotCache(
 			defaultRuntimeSnapshotTTL, time.Now,
 		),
+		Divisions: newCardDivisionState(time.Now),
 	}, runtime
 }
 
@@ -1475,7 +1476,7 @@ func TestArrangeCardGivesARetryItsOwnOperation(t *testing.T) {
 			[]corev1.Pod{*pod}, map[string]*RuntimeSnapshot{pod.Name: snapshot})
 		ledger := ledgers[pod.Name]
 		require.True(t, ledger.judgeable)
-		_, err := r.arrangeCard(context.Background(), pod, ledger, ledger.engines)
+		_, err := r.arrangeCard(context.Background(), pod, ledger, ledger.engines, placementDivision)
 		require.NoError(t, err)
 	}
 
@@ -1519,7 +1520,7 @@ func divideOnce(t *testing.T, r *ModelClaimReconciler, pod *corev1.Pod, snapshot
 		[]corev1.Pod{*pod}, map[string]*RuntimeSnapshot{pod.Name: snapshot})
 	ledger := ledgers[pod.Name]
 	require.True(t, ledger.judgeable)
-	_, err := r.arrangeCard(context.Background(), pod, ledger, ledger.engines)
+	_, err := r.arrangeCard(context.Background(), pod, ledger, ledger.engines, placementDivision)
 	return err
 }
 
