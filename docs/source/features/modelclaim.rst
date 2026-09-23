@@ -335,12 +335,15 @@ exactly what the card can hold, so an engine growing into its new limit cannot
 grow into another engine's memory.
 
 The plan is carried out in an order that never leaves two engines entitled to
-the same byte. The limits are written first, shrinking before growing, and a
-fresh reading then has to agree. That step is not a formality: the CLI the
-runtime drives exits zero when there is no segment to write into, so reading
-the limit back is the only evidence there is. Only then is each new limit
-recorded on its own claim, and the new instance after them, so a division that
-fails part way changes no record. A model stays non-routable until its own
+the same byte. The limits that shrink an engine are written first, and a fresh
+reading has to confirm them before any engine grows. A lower limit evicts
+nothing, so the room a shrink makes is not there until the engine is seen
+inside its new limit. The limits that grow an engine are written next, and
+read back the same way. Reading back is not a formality: the CLI the runtime
+drives exits zero when there is no segment to write into, so reading the limit
+back is the only evidence there is. Only then is each new limit recorded on its
+own claim, and the new instance after them, so a division that fails part way
+changes no record. A model stays non-routable until its own
 limit is in force, and stays routable only while it is held to no more than
 that limit. A card that could not be arranged is skipped, and the next Pod in
 line is tried.
