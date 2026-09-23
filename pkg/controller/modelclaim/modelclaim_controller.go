@@ -82,9 +82,6 @@ type ModelClaimReconciler struct {
 	// Layer 2 node weight-cache signal). Phase 1 uses uniformLocality, so
 	// placement is load-only until node state reporting is added back.
 	Locality LocalityProvider
-	// SnapshotCache stores bounded runtime observations for placement. It is
-	// process-local so a leader restart naturally rehydrates from sidecars.
-	SnapshotCache *runtimeSnapshotCache
 	// PoolPolicy serializes controller-local policy ticks and retains only the
 	// request-counter deltas needed for conservative KV allocation. It is not a
 	// desired-state store; runtime snapshots remain authoritative after restart.
@@ -108,11 +105,8 @@ func Add(mgr manager.Manager, _ config.RuntimeConfig) error {
 		Runtime:    NewRuntimeClient(),
 		Locality:   uniformLocality{},
 		PoolPolicy: newPoolPolicyManager(time.Now),
-		SnapshotCache: newRuntimeSnapshotCache(
-			defaultRuntimeSnapshotTTL, time.Now,
-		),
-		Divisions: newCardDivisionState(time.Now),
-		APIReader: mgr.GetAPIReader(),
+		Divisions:  newCardDivisionState(time.Now),
+		APIReader:  mgr.GetAPIReader(),
 	}
 
 	err := ctrl.NewControllerManagedBy(mgr).
@@ -202,12 +196,15 @@ func (r *ModelClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	pruneDeadInstances(pm, candidates)
 	r.setStatusFields(pm, candidates)
+	// Every step below reads a runtime through this, so each runtime is read
+	// once in this pass unless a step changes it.
+	readings := newRuntimeReadings(r.Runtime)
 
 	// Drive the model towards its desired number of active instances by
 	// bin-packing onto warm pods and asking the runtime sidecar to activate it.
 	switch {
 	case desiredReplicas(pm) > int32(len(pm.Status.Instances)):
-		if err := r.ensureActivated(ctx, pm, candidates); err != nil {
+		if err := r.ensureActivated(ctx, pm, candidates, readings); err != nil {
 			if apierrors.IsConflict(err) {
 				// The claim was read a moment too early to be written. No engine
 				// was asked for, so nothing failed.
@@ -228,16 +225,16 @@ func (r *ModelClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			// A card divided for an engine that then did not start has lost that
 			// engine again. Divide it now, so its neighbours get back the room
 			// they gave up for it.
-			r.divideCards(ctx, candidates)
+			r.divideCards(ctx, candidates, readings)
 			return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, nil
 		}
 	case desiredReplicas(pm) < int32(len(pm.Status.Instances)):
-		r.scaleDown(ctx, pm, desiredReplicas(pm))
+		r.scaleDown(ctx, pm, desiredReplicas(pm), readings)
 	}
 
 	// Reconcile instance routability against live engine readiness (promote
 	// ready Activating instances, demote Active instances that went unhealthy).
-	r.reconcileInstanceHealth(ctx, pm)
+	r.reconcileInstanceHealth(ctx, pm, readings)
 	r.recomputeReadiness(pm)
 	setClaimGauges(pm)
 	if err := r.Status().Update(ctx, pm); err != nil {
@@ -246,12 +243,12 @@ func (r *ModelClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// Pool policy is an optional, Deployment-scoped control loop. It runs after
 	// claim status is persisted so a policy failure cannot block activation
 	// or route-health convergence for this claim.
-	r.reconcilePoolPolicies(ctx, candidates)
+	r.reconcilePoolPolicies(ctx, candidates, readings)
 	// Cards whose engines all declare what they cost are divided again by the
 	// planner placement uses, so each share follows load rather than staying
 	// what it was when the last model landed. It runs last, after anything this
 	// pass changed on the cards.
-	r.divideCards(ctx, candidates)
+	r.divideCards(ctx, candidates, readings)
 	return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, nil
 }
 
@@ -412,13 +409,17 @@ func (r *ModelClaimReconciler) recomputeReadiness(pm *modelv1alpha1.ModelClaim) 
 // warm pods and asking the runtime sidecar to activate an engine process on
 // each. Lack of an available warm pod is not an error (the model stays Pending and
 // reconciles again); only runtime failures propagate.
-func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1alpha1.ModelClaim, candidates []corev1.Pod) error {
+func (r *ModelClaimReconciler) ensureActivated(
+	ctx context.Context,
+	pm *modelv1alpha1.ModelClaim,
+	candidates []corev1.Pod,
+	readings *runtimeReadings,
+) error {
 	load := r.computePodLoad(ctx, pm.Namespace)
 	parallelism, err := modelParallelism(pm)
 	if err != nil {
 		return fmt.Errorf("invalid engineConfig parallelism: %w", err)
 	}
-	placementStates := r.collectPlacementStates(ctx, candidates, pm.Spec.ArtifactURL, parallelism)
 
 	// A claim is only placed where a card's account shows the room for it, so
 	// a claim that does not say what it costs is not placed anywhere. Placed
@@ -437,8 +438,13 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 		}
 		return nil
 	}
+	// The account and the ranking are made from the same reading of each
+	// runtime, so two admitted pods are never ordered by numbers that
+	// contradict the gate they just passed.
+	snapshots := readings.ofPods(ctx, candidates)
+	placementStates := placementStatesFrom(snapshots, candidates, pm.Spec.ArtifactURL, parallelism)
 	claims, listErr := r.listClaimsForAccount(ctx, pm.Namespace)
-	ledgers := podLedgersFrom(claims, listErr, candidates, r.freshSnapshots(ctx, candidates))
+	ledgers := podLedgersFrom(claims, listErr, candidates, snapshots)
 	admissible, refusals := admissibleCandidates(candidates, ledgers, perGPU.minimumReserveBytes())
 	rankByRoom(placementStates, ledgers)
 
@@ -473,7 +479,7 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 		// a recorded limit always means that a card was divided for it.
 		kvLimitBytes := int64(0)
 		if podHasGPUs(*pod, ledgers[pod.Name].accelerators) {
-			planned, roomErr := r.makeRoomOnPod(ctx, pm, perGPU, pod, ledgers[pod.Name])
+			planned, roomErr := r.makeRoomOnPod(ctx, pm, perGPU, pod, ledgers[pod.Name], readings)
 			if roomErr != nil {
 				// The card had room for this model and could not be divided to
 				// make it, most often because an engine on it did not take its new
@@ -512,6 +518,7 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 		}
 
 		resp, aerr := r.Runtime.Activate(ctx, pod.Status.PodIP, DefaultRuntimePort, activateRequest(pm))
+		readings.forget(pod.Name)
 		if aerr != nil {
 			recordActivation(pm.Namespace, servedModelName(pm), false)
 			// The record was written first to guard against a crash between
@@ -593,6 +600,7 @@ func (r *ModelClaimReconciler) makeRoomOnPod(
 	perGPU perGPUBytes,
 	pod *corev1.Pod,
 	ledger podLedger,
+	readings *runtimeReadings,
 ) (int64, error) {
 	newcomer := engineOnPod{
 		claimName:       pm.Name,
@@ -601,7 +609,7 @@ func (r *ModelClaimReconciler) makeRoomOnPod(
 		kvCapacityBytes: kvLimitUnknown,
 	}
 	engines := append(append([]engineOnPod(nil), ledger.engines...), newcomer)
-	limits, err := r.arrangeCard(ctx, pod, ledger, engines, placementDivision)
+	limits, err := r.arrangeCard(ctx, pod, ledger, engines, placementDivision, readings)
 	if err != nil {
 		return 0, err
 	}
@@ -634,6 +642,7 @@ func (r *ModelClaimReconciler) arrangeCard(
 	ledger podLedger,
 	engines []engineOnPod,
 	why division,
+	readings *runtimeReadings,
 ) ([]plannedKVLimit, error) {
 	limits, err := planKVLimits(ledger.hbmUsableBytes, engines)
 	if err != nil {
@@ -647,7 +656,8 @@ func (r *ModelClaimReconciler) arrangeCard(
 	var written []plannedKVLimit
 	for _, step := range [][]plannedKVLimit{shrinks, grows} {
 		written = append(written, step...)
-		if err := r.writeAndConfirmKVLimits(ctx, pod, ledger, step); err != nil {
+		if err := r.writeAndConfirmKVLimits(ctx, pod, ledger, step, readings); err != nil {
+			readings.forget(pod.Name)
 			return nil, err
 		}
 	}
@@ -696,12 +706,14 @@ func (r *ModelClaimReconciler) arrangeCard(
 }
 
 // writeAndConfirmKVLimits writes one step of a card's division and reads the
-// card back to confirm it. A step with nothing to write reads nothing.
+// card back to confirm it. A step with nothing to write reads nothing. The
+// reading taken to confirm the step becomes the pass's reading of the card.
 func (r *ModelClaimReconciler) writeAndConfirmKVLimits(
 	ctx context.Context,
 	pod *corev1.Pod,
 	ledger podLedger,
 	limits []plannedKVLimit,
+	readings *runtimeReadings,
 ) error {
 	if len(limits) == 0 {
 		return nil
@@ -720,12 +732,17 @@ func (r *ModelClaimReconciler) writeAndConfirmKVLimits(
 			LimitBytes:  limit.kvLimitBytes,
 			OperationID: operationID,
 		}); err != nil {
+			readings.forget(pod.Name)
 			return fmt.Errorf("set %s to %s: %w", limit.modelName, gibibytes(limit.kvLimitBytes), err)
 		}
 	}
+	readings.forget(pod.Name)
 	snapshot, err := r.Runtime.Snapshot(ctx, pod.Status.PodIP, DefaultRuntimePort)
 	if err != nil {
 		return fmt.Errorf("read back the limits on %s: %w", pod.Name, err)
+	}
+	if snapshot != nil {
+		readings.replace(pod, snapshot)
 	}
 	return confirmKVLimits(snapshot, limits)
 }
@@ -776,50 +793,21 @@ func (r *ModelClaimReconciler) recordKVLimit(
 	return claim, nil
 }
 
-// freshSnapshots reads every candidate's runtime directly, going around the
-// snapshot cache. Ranking can work from a reading a few seconds old, and an
-// account cannot: what an engine holds moves with traffic, and a model admitted
-// against memory another engine has since mapped is how a card ends up
-// oversubscribed. A pod whose runtime did not answer is simply absent.
-func (r *ModelClaimReconciler) freshSnapshots(
-	ctx context.Context,
-	candidates []corev1.Pod,
-) map[string]*RuntimeSnapshot {
-	snapshots := make(map[string]*RuntimeSnapshot, len(candidates))
-	for i := range candidates {
-		pod := &candidates[i]
-		snapshot, err := r.Runtime.Snapshot(ctx, pod.Status.PodIP, DefaultRuntimePort)
-		if err != nil || snapshot == nil {
-			klog.V(4).InfoS("placement could not read a runtime",
-				"pod", klog.KObj(pod), "err", err)
-			continue
-		}
-		snapshots[pod.Name] = snapshot
-	}
-	return snapshots
-}
-
-func (r *ModelClaimReconciler) collectPlacementStates(
-	ctx context.Context,
+// placementStatesFrom summarises each candidate's reading for ranking. A pod
+// whose runtime did not answer has no state, and ranks as unknown.
+func placementStatesFrom(
+	snapshots map[string]*RuntimeSnapshot,
 	candidates []corev1.Pod,
 	artifactURL string,
 	parallelism int64,
 ) map[string]PodPlacementState {
 	states := make(map[string]PodPlacementState, len(candidates))
-	if r.SnapshotCache == nil {
-		return states
-	}
 	for i := range candidates {
-		pod := &candidates[i]
-		key := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
-		snapshot, ok := r.SnapshotCache.Get(key, pod.UID, func() (*RuntimeSnapshot, error) {
-			return r.Runtime.Snapshot(ctx, pod.Status.PodIP, DefaultRuntimePort)
-		})
-		if !ok {
+		snapshot, found := snapshots[candidates[i].Name]
+		if !found {
 			continue
 		}
-		state := placementStateFromSnapshot(snapshot, artifactURL, parallelism)
-		states[pod.Name] = state
+		states[candidates[i].Name] = placementStateFromSnapshot(snapshot, artifactURL, parallelism)
 	}
 	return states
 }
@@ -829,7 +817,11 @@ func (r *ModelClaimReconciler) collectPlacementStates(
 // controller never promotes an engine merely because its old status entry was
 // Active. A snapshot failure leaves the last known routing in place rather
 // than guessing that a live engine has disappeared.
-func (r *ModelClaimReconciler) reconcileInstanceHealth(ctx context.Context, pm *modelv1alpha1.ModelClaim) {
+func (r *ModelClaimReconciler) reconcileInstanceHealth(
+	ctx context.Context,
+	pm *modelv1alpha1.ModelClaim,
+	readings *runtimeReadings,
+) {
 	served := servedModelName(pm)
 	dropped := map[string]bool{}
 	for i := range pm.Status.Instances {
@@ -840,11 +832,13 @@ func (r *ModelClaimReconciler) reconcileInstanceHealth(ctx context.Context, pm *
 			inst.Phase != modelv1alpha1.ModelClaimFailed {
 			continue
 		}
-		ip := r.podIP(ctx, pm.Namespace, inst.Pod)
-		if ip == "" {
+		pod := &corev1.Pod{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: pm.Namespace, Name: inst.Pod}, pod); err != nil ||
+			pod.Status.PodIP == "" {
 			continue // pod gone; pruneDeadInstances will drop it
 		}
-		snapshot, err := r.Runtime.Snapshot(ctx, ip, DefaultRuntimePort)
+		ip := pod.Status.PodIP
+		snapshot, err := readings.of(ctx, pod)
 		if err != nil {
 			klog.V(4).InfoS("runtime snapshot failed", "model", pm.Name, "pod", inst.Pod, "phase", inst.Phase, "err", err)
 			continue
@@ -853,17 +847,13 @@ func (r *ModelClaimReconciler) reconcileInstanceHealth(ctx context.Context, pm *
 
 		if engineMissing(inst, snapshot, observed) {
 			dropped[inst.Pod] = !r.startMissingEngine(ctx, pm, inst, ip)
+			readings.forget(pod.Name)
 			continue
 		}
 
 		observedPort := inst.Port
 		if observed != nil {
 			observedPort = observed.Port
-		}
-
-		pod := &corev1.Pod{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: pm.Namespace, Name: inst.Pod}, pod); err != nil {
-			continue
 		}
 
 		// An engine on a GPU becomes routable only once it holds the KV limit
@@ -886,6 +876,7 @@ func (r *ModelClaimReconciler) reconcileInstanceHealth(ctx context.Context, pm *
 		// neighbour has not given back.
 		if serving && !limitInForce && (!limitWithinRecord || inst.Phase != modelv1alpha1.ModelClaimActive) {
 			r.writeKVLimit(ctx, pm, inst, pod, ip, snapshot, observed)
+			readings.forget(pod.Name)
 		}
 
 		if err := r.annotateWarmPodWithState(
@@ -1184,7 +1175,12 @@ func (r *ModelClaimReconciler) deannotateWarmPod(ctx context.Context, namespace,
 }
 
 // scaleDown deactivates surplus instances until the desired count is met.
-func (r *ModelClaimReconciler) scaleDown(ctx context.Context, pm *modelv1alpha1.ModelClaim, target int32) {
+func (r *ModelClaimReconciler) scaleDown(
+	ctx context.Context,
+	pm *modelv1alpha1.ModelClaim,
+	target int32,
+	readings *runtimeReadings,
+) {
 	for int32(len(pm.Status.Instances)) > target && len(pm.Status.Instances) > 0 {
 		idx := len(pm.Status.Instances) - 1
 		inst := pm.Status.Instances[idx]
@@ -1196,6 +1192,7 @@ func (r *ModelClaimReconciler) scaleDown(ctx context.Context, pm *modelv1alpha1.
 			}); err != nil {
 				klog.ErrorS(err, "scale-down deactivate failed", "pod", inst.Pod, "model", pm.Name)
 			}
+			readings.forget(inst.Pod)
 		}
 		pm.Status.Instances = pm.Status.Instances[:idx]
 	}
