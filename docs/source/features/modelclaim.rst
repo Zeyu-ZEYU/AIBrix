@@ -348,18 +348,20 @@ restarts run out. Its seat and its KV go back to the card, for the engines
 beside it and for the next model placed there.
 
 The plan is carried out in an order that never leaves two engines entitled to
-the same byte. The limits that shrink an engine are written first, and a fresh
-reading has to confirm them before any engine grows. A lower limit evicts
-nothing, so the room a shrink makes is not there until the engine is seen
-inside its new limit. The limits that grow an engine are written next, and
-read back the same way. Reading back is not a formality: the CLI the runtime
-drives exits zero when there is no segment to write into, so reading the limit
-back is the only evidence there is. Only then is each new limit recorded on its
-own claim, and the new instance after them, so a division that fails part way
-changes no record. A model stays non-routable until its own
-limit is in force, and stays routable only while it is held to no more than
-that limit. A card that could not be arranged is skipped, and the next Pod in
-line is tried.
+the same byte, and never holds an engine to more than its record. The limits
+that shrink an engine are written first, and a fresh reading has to confirm
+them before anything else happens. A lower limit evicts nothing, so the room a
+shrink makes is not there until the engine is seen inside its new limit.
+Reading back is not a formality: the CLI the runtime drives exits zero when
+there is no segment to write into, so reading the limit back is the only
+evidence there is. Each new limit is then recorded on its own claim, and the
+new instance after them. The limits that grow an engine are written last, and
+read back the same way. A shrink that fails changes no record. A grow that
+fails leaves the engine below its new record, where it keeps its route, and
+the next round grows it. A model stays non-routable until its own limit is in
+force, and stays routable only while it is held to no more than that limit. A
+card whose room could not be made is skipped, and the next Pod in line is
+tried.
 
 A card is also divided again every round, so that each share follows the load
 on its engine. It is divided at most once a round, however many claims sit on
