@@ -672,9 +672,15 @@ Claim remains ``Pending`` with ``NoMatchingPods`` about GPU memory
    that is promised to, or held by, the instances on it. A Pod is also turned
    away when its runtime did not answer, when one of its cards could not be
    measured, when a claim on it declares no usable ``perGPU``, or when an
-   engine there belongs to no claim on it. The claim is tried again on every
-   pass, and the ``NoMatchingPods`` Event is raised only when the refusal
-   changes. The ``Scheduled`` condition always carries the current one.
+   engine there belongs to no claim on it. The ``NoMatchingPods`` Event is
+   raised only when the refusal changes, and the ``Scheduled`` condition
+   always carries the current one.
+
+   A refused claim backs off. Each refusal in a row doubles the wait before
+   the next try: 10, 20 and 40 seconds, then a minute at most. A model that
+   waits for room therefore does not have every runtime in the pool read for
+   it every 10 seconds. The wait is kept in the controller's memory only, so
+   a restart tries every waiting claim at once.
 
 Claim remains ``Pending`` with ``InvalidPerGPU``
    ``perGPU`` is missing, or one of its figures is not positive, and the
