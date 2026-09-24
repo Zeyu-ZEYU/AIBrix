@@ -69,10 +69,14 @@ const (
 	// and health checks).
 	DefaultRequeueDuration = 10 * time.Second
 
-	// ActivatingRequeueDuration paces a claim while an engine of it is coming
-	// up, so the engine takes traffic within this long of being ready rather
-	// than a whole period later.
+	// ActivatingRequeueDuration paces a claim while an engine of it is
+	// booting, so the engine takes traffic within this long of being ready
+	// rather than a whole period later.
 	ActivatingRequeueDuration = 2 * time.Second
+
+	// ActivatingRequeueWindow is how long into a boot that faster pace lasts.
+	// An engine still booting after this long is looked at every period.
+	ActivatingRequeueWindow = 5 * time.Minute
 )
 
 // ModelClaimReconciler reconciles a ModelClaim object.
@@ -264,7 +268,7 @@ func (r *ModelClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	// Reconcile instance routability against live engine readiness (promote
 	// ready Activating instances, demote Active instances that went unhealthy).
-	r.reconcileInstanceHealth(ctx, pm, readings)
+	booting := r.reconcileInstanceHealth(ctx, pm, readings)
 	r.recomputeReadiness(pm)
 	setClaimGauges(pm)
 	if err := r.Status().Update(ctx, pm); err != nil {
@@ -279,22 +283,12 @@ func (r *ModelClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// what it was when the last model landed. It runs last, after anything this
 	// pass changed on the cards.
 	r.divideCards(ctx, candidates, readings)
-	// An engine coming up is looked at again soon, so it takes traffic within
-	// a couple of seconds of being ready.
-	if hasActivatingInstance(pm) {
+	// A booting engine is looked at again soon, so it takes traffic within a
+	// couple of seconds of being ready.
+	if booting {
 		requeueAfter = min(requeueAfter, ActivatingRequeueDuration)
 	}
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
-}
-
-// hasActivatingInstance reports whether an engine of the claim is coming up.
-func hasActivatingInstance(pm *modelv1alpha1.ModelClaim) bool {
-	for _, instance := range pm.Status.Instances {
-		if instance.Phase == modelv1alpha1.ModelClaimActivating {
-			return true
-		}
-	}
-	return false
 }
 
 // requeueOnConflict lets the next reconcile work from the latest API object.
@@ -898,12 +892,13 @@ func placementStatesFrom(
 // Snapshot state is authoritative for the engine port and readiness: the
 // controller never promotes an engine merely because its old status entry was
 // Active. A snapshot failure leaves the last known routing in place rather
-// than guessing that a live engine has disappeared.
+// than guessing that a live engine has disappeared. It reports whether it left
+// an instance Activating on an engine that is booting.
 func (r *ModelClaimReconciler) reconcileInstanceHealth(
 	ctx context.Context,
 	pm *modelv1alpha1.ModelClaim,
 	readings *runtimeReadings,
-) {
+) (booting bool) {
 	served := servedModelName(pm)
 	dropped := map[string]bool{}
 	for i := range pm.Status.Instances {
@@ -957,6 +952,7 @@ func (r *ModelClaimReconciler) reconcileInstanceHealth(
 				}
 			}
 		}
+		booting = booting || state.booting
 		desiredPhase, routingPort := state.phase, state.routingPort
 		serving := state.serving
 
@@ -1008,6 +1004,7 @@ func (r *ModelClaimReconciler) reconcileInstanceHealth(
 		}
 	}
 	r.dropInstances(ctx, pm, dropped)
+	return booting
 }
 
 // judgeKVLimit says whether an engine is held to the limit its instance
@@ -1071,6 +1068,9 @@ type engineState struct {
 	limitWithinRecord bool
 	phase             modelv1alpha1.ModelClaimPhase
 	routingPort       int32
+	// booting is set for an instance left Activating while its engine boots,
+	// which is worth looking at again soon.
+	booting bool
 }
 
 // judgeEngine reads an instance's engine from one reading of its runtime.
@@ -1097,7 +1097,22 @@ func (r *ModelClaimReconciler) judgeEngine(
 		ctx, pm, pod, inst, accelerators, observed, state.serving)
 	state.phase, state.routingPort = desiredInstanceState(
 		inst, observed, state.observedPort, state.serving, state.limitInForce, state.limitWithinRecord)
+	state.booting = state.phase == modelv1alpha1.ModelClaimActivating && engineBooting(snapshot, observed)
 	return state
+}
+
+// engineBooting reports whether a runtime reading shows an engine booting:
+// alive but not yet ready, and for less than ActivatingRequeueWindow. The
+// time is taken on the runtime's clock, which also dates the boot, so the
+// controller's clock does not have to agree with it. An engine that is ready
+// but not yet routable is not booting. Neither is one whose boot the runtime
+// does not date, since nothing would then bound it.
+func engineBooting(snapshot *RuntimeSnapshot, observed *RuntimeSnapshotModel) bool {
+	if snapshot == nil || observed == nil || !observed.Alive || observed.Ready ||
+		observed.LastTransition == nil || snapshot.ObservedAt.IsZero() {
+		return false
+	}
+	return snapshot.ObservedAt.Sub(*observed.LastTransition) < ActivatingRequeueWindow
 }
 
 // engineMissing reports whether an activating instance has no engine behind
