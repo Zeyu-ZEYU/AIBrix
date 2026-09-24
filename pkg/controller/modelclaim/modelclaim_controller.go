@@ -490,15 +490,26 @@ func (r *ModelClaimReconciler) ensureActivated(
 			// once the wait is up. The refusal is raised as an Event only when
 			// it changes, as InvalidPerGPU is. The same refusal on each try is
 			// not news; the condition always carries the current one.
+			reason := "NoMatchingPods"
 			message := noPlacementMessage(selectErr, admissible, refusals, perGPU.minimumReserveBytes())
+			// A model bigger than every card would otherwise read as one that
+			// waits for room, and nobody would learn it can never be placed.
+			if largest, never := tooLargeForEveryCard(candidates, ledgers, perGPU.minimumReserveBytes()); never &&
+				len(admissible) == 0 {
+				reason = "TooLargeForAnyCard"
+				message = fmt.Sprintf("no card in the pool can hold this model, which needs %s on a card; "+
+					"the largest holds %s", gibibytes(perGPU.minimumReserveBytes()), gibibytes(largest))
+			}
 			if meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
 				Type:    string(modelv1alpha1.ModelClaimConditionTypeScheduled),
 				Status:  metav1.ConditionFalse,
-				Reason:  "NoMatchingPods",
+				Reason:  reason,
 				Message: message,
 			}) {
-				r.Recorder.Event(pm, corev1.EventTypeWarning, "NoMatchingPods", message)
+				r.Recorder.Event(pm, corev1.EventTypeWarning, reason, message)
 			}
+			// It still waits with backoff: a larger pod may join, or the
+			// claim's declaration may shrink, and either wakes it.
 			return backoff.refused(claim, pm.Generation, room), nil
 		}
 
