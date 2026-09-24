@@ -126,6 +126,11 @@ func Add(mgr manager.Manager, _ config.RuntimeConfig) error {
 		Watches(&corev1.Pod{},
 			handler.EnqueueRequestsFromMapFunc(enqueueModelClaimsForPod(mgr.GetClient())),
 			builder.WithPredicates(modelPoolPodFilter())).
+		// Wake the claims waiting for a card when another claim may have freed
+		// one, rather than leave them to sleep through their wait.
+		Watches(&modelv1alpha1.ModelClaim{},
+			handler.EnqueueRequestsFromMapFunc(enqueueWaitingClaims(mgr.GetClient())),
+			builder.WithPredicates(roomMayHaveFreed())).
 		Complete(r)
 	if err != nil {
 		return err
@@ -429,12 +434,21 @@ func (r *ModelClaimReconciler) ensureActivated(
 ) (time.Duration, error) {
 	claim := types.NamespacedName{Namespace: pm.Namespace, Name: pm.Name}
 	backoff := r.backoff()
-	if due, left := backoff.due(claim); !due {
-		// No card could hold this model a moment ago. Reading every runtime in
-		// the pool again changes nothing until the pool does.
+	// The cached listing is enough to count each pod's load and to tell
+	// whether room may have appeared. The account is built from a fresh one.
+	cached := &modelv1alpha1.ModelClaimList{}
+	if err := r.List(ctx, cached, client.InNamespace(pm.Namespace)); err != nil {
+		klog.ErrorS(err, "list model claims", "namespace", pm.Namespace)
+		cached = nil
+	}
+	room := roomSignatureOf(candidates, cached)
+	if due, left := backoff.due(claim, pm.Generation, room); !due {
+		// No card could hold this model a moment ago, and nothing that could
+		// make room has happened since. Reading every runtime in the pool
+		// again changes nothing until the pool does.
 		return left, nil
 	}
-	load := r.computePodLoad(ctx, pm.Namespace)
+	load := podLoadFrom(cached)
 	parallelism, err := modelParallelism(pm)
 	if err != nil {
 		return 0, fmt.Errorf("invalid engineConfig parallelism: %w", err)
@@ -485,7 +499,7 @@ func (r *ModelClaimReconciler) ensureActivated(
 			}) {
 				r.Recorder.Event(pm, corev1.EventTypeWarning, "NoMatchingPods", message)
 			}
-			return backoff.refused(claim), nil
+			return backoff.refused(claim, pm.Generation, room), nil
 		}
 
 		// Divide the card between the engines on it and this one, and hold
@@ -1284,13 +1298,12 @@ func (r *ModelClaimReconciler) deactivateInstances(ctx context.Context, pm *mode
 	}
 }
 
-// computePodLoad tallies how many model instances each warm pod currently hosts,
-// across all ModelClaims in the namespace, for least-loaded bin-packing.
-func (r *ModelClaimReconciler) computePodLoad(ctx context.Context, namespace string) map[string]int {
+// podLoadFrom tallies how many model instances each warm pod currently hosts,
+// across all ModelClaims in the namespace, for least-loaded bin-packing. With
+// no listing every pod counts as empty.
+func podLoadFrom(list *modelv1alpha1.ModelClaimList) map[string]int {
 	load := map[string]int{}
-	list := &modelv1alpha1.ModelClaimList{}
-	if err := r.List(ctx, list, client.InNamespace(namespace)); err != nil {
-		klog.ErrorS(err, "compute pod load: list model claims", "namespace", namespace)
+	if list == nil {
 		return load
 	}
 	for i := range list.Items {
