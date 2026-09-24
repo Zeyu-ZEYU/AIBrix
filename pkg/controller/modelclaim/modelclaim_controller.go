@@ -90,6 +90,10 @@ type ModelClaimReconciler struct {
 	// Divisions remembers when each card was last divided to follow its load,
 	// so that a card is divided once per round however many claims sit on it.
 	Divisions *cardDivisionState
+	// Backoff spaces out the tries of claims no card in the pool can hold, so
+	// a model waiting for room does not have every runtime read for it every
+	// round.
+	Backoff *placementBackoff
 	// APIReader reads ModelClaims straight from the API server for the GPU
 	// memory account, where an instance recorded moments ago and not yet in the
 	// informer would read as free memory. Falls back to the cached client when
@@ -107,6 +111,7 @@ func Add(mgr manager.Manager, _ config.RuntimeConfig) error {
 		Locality:   uniformLocality{},
 		PoolPolicy: newPoolPolicyManager(time.Now),
 		Divisions:  newCardDivisionState(time.Now),
+		Backoff:    newPlacementBackoff(time.Now),
 		APIReader:  mgr.GetAPIReader(),
 	}
 
@@ -151,6 +156,7 @@ func (r *ModelClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if controllerutil.ContainsFinalizer(pm, ModelClaimFinalizer) {
 			r.deactivateInstances(ctx, pm)
 			clearClaimMetrics(pm.Namespace, servedModelName(pm))
+			r.backoff().placed(req.NamespacedName)
 			controllerutil.RemoveFinalizer(pm, ModelClaimFinalizer)
 			if err := r.Update(ctx, pm); err != nil {
 				return requeueOnConflict(err)
@@ -203,9 +209,11 @@ func (r *ModelClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	// Drive the model towards its desired number of active instances by
 	// bin-packing onto warm pods and asking the runtime sidecar to activate it.
+	requeueAfter := DefaultRequeueDuration
 	switch {
 	case desiredReplicas(pm) > int32(len(pm.Status.Instances)):
-		if err := r.ensureActivated(ctx, pm, candidates, readings); err != nil {
+		wait, err := r.ensureActivated(ctx, pm, candidates, readings)
+		if err != nil {
 			if apierrors.IsConflict(err) {
 				// The claim was read a moment too early to be written. No engine
 				// was asked for, so nothing failed.
@@ -229,6 +237,12 @@ func (r *ModelClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			r.divideCards(ctx, candidates, readings)
 			return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, nil
 		}
+		// A claim with nothing placed has nothing else to do each round, so it
+		// comes back when its wait is up. One with an instance keeps coming
+		// back every round, to check that instance's engine.
+		if wait > 0 && len(pm.Status.Instances) == 0 {
+			requeueAfter = wait
+		}
 	case desiredReplicas(pm) < int32(len(pm.Status.Instances)):
 		r.scaleDown(ctx, pm, desiredReplicas(pm), readings)
 	}
@@ -250,7 +264,7 @@ func (r *ModelClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// stay what it was when the last model landed. It runs last, after anything
 	// this pass changed on the cards.
 	r.divideCards(ctx, candidates, readings)
-	return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, nil
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 // requeueOnConflict lets the next reconcile work from the latest API object.
@@ -410,16 +424,26 @@ func (r *ModelClaimReconciler) recomputeReadiness(pm *modelv1alpha1.ModelClaim) 
 // warm pods and asking the runtime sidecar to activate an engine process on
 // each. Lack of an available warm pod is not an error (the model stays Pending and
 // reconciles again); only runtime failures propagate.
+//
+// A claim no card could hold backs off, and the duration returned is how long
+// it waits before its next try. It is zero when there is nothing to wait for.
 func (r *ModelClaimReconciler) ensureActivated(
 	ctx context.Context,
 	pm *modelv1alpha1.ModelClaim,
 	candidates []corev1.Pod,
 	readings *runtimeReadings,
-) error {
+) (time.Duration, error) {
+	claim := types.NamespacedName{Namespace: pm.Namespace, Name: pm.Name}
+	backoff := r.backoff()
+	if due, left := backoff.due(claim); !due {
+		// No card could hold this model a moment ago. Reading every runtime in
+		// the pool again changes nothing until the pool does.
+		return left, nil
+	}
 	load := r.computePodLoad(ctx, pm.Namespace)
 	parallelism, err := modelParallelism(pm)
 	if err != nil {
-		return fmt.Errorf("invalid engineConfig parallelism: %w", err)
+		return 0, fmt.Errorf("invalid engineConfig parallelism: %w", err)
 	}
 
 	// A claim is only placed where a card's account shows the room for it, so
@@ -437,7 +461,7 @@ func (r *ModelClaimReconciler) ensureActivated(
 		}) {
 			r.Recorder.Event(pm, corev1.EventTypeWarning, "InvalidPerGPU", message)
 		}
-		return nil
+		return 0, nil
 	}
 	// The account and the ranking are made from the same reading of each
 	// runtime. So two admitted pods are never ordered by numbers that
@@ -454,11 +478,10 @@ func (r *ModelClaimReconciler) ensureActivated(
 			admissible, instancePods(pm), load, servedModelName(pm), r.Locality, placementStates,
 		)
 		if selectErr != nil {
-			// No available warm pod right now; remain Pending and retry on
-			// requeue. The refusal is raised as an Event only when it changes,
-			// as InvalidPerGPU is. The claim is tried again on every pass, and
-			// the same refusal each time is not news; the condition always
-			// carries the current one.
+			// No available warm pod right now; remain Pending and try again
+			// once the wait is up. The refusal is raised as an Event only when
+			// it changes, as InvalidPerGPU is. The same refusal on each try is
+			// not news; the condition always carries the current one.
 			message := noPlacementMessage(selectErr, admissible, refusals, perGPU.minimumReserveBytes())
 			if meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
 				Type:    string(modelv1alpha1.ModelClaimConditionTypeScheduled),
@@ -468,7 +491,7 @@ func (r *ModelClaimReconciler) ensureActivated(
 			}) {
 				r.Recorder.Event(pm, corev1.EventTypeWarning, "NoMatchingPods", message)
 			}
-			return nil
+			return backoff.refused(claim), nil
 		}
 
 		// Divide the card between the engines on it and this one, and hold
@@ -515,7 +538,7 @@ func (r *ModelClaimReconciler) ensureActivated(
 			KVLimitBytes: kvLimitBytes,
 		})
 		if err := r.Status().Update(ctx, pm); err != nil {
-			return fmt.Errorf("reserve %s on %s: %w", servedModelName(pm), pod.Name, err)
+			return 0, fmt.Errorf("reserve %s on %s: %w", servedModelName(pm), pod.Name, err)
 		}
 
 		resp, aerr := r.Runtime.Activate(ctx, pod.Status.PodIP, DefaultRuntimePort, activateRequest(pm))
@@ -539,7 +562,7 @@ func (r *ModelClaimReconciler) ensureActivated(
 			} else {
 				markPlaced(pm, pod)
 			}
-			return aerr
+			return 0, aerr
 		}
 		pm.Status.Instances[len(pm.Status.Instances)-1].Port = resp.Port
 
@@ -549,15 +572,16 @@ func (r *ModelClaimReconciler) ensureActivated(
 		// confirms the engine is ready, then it flips the annotation to the real
 		// port. This means the gateway never routes to a still-booting engine.
 		if err := r.annotateWarmPod(ctx, pm, pod, 0); err != nil {
-			return err
+			return 0, err
 		}
+		backoff.placed(claim)
 
 		markPlaced(pm, pod)
 		load[pod.Name]++
 		r.Recorder.Eventf(pm, corev1.EventTypeNormal, "Activating",
 			"model %s engine starting on pod %s:%d", servedModelName(pm), pod.Name, resp.Port)
 	}
-	return nil
+	return 0, nil
 }
 
 // markPlaced says on the Scheduled condition that a claim found a card. Being
