@@ -98,6 +98,9 @@ type engineOnPod struct {
 	// inFlightRequests is the demand an engine's part of the spare KV is
 	// weighed by: its running and waiting requests.
 	inFlightRequests int64
+	// demandUnknown is whether the engine serves but its request metrics could
+	// not be read, so its demand is not known.
+	demandUnknown bool
 	// asleep is whether the runtime reports the engine sleeping. A sleeping
 	// engine serves nothing, so it is given no part of the spare KV.
 	asleep bool
@@ -266,11 +269,17 @@ func podLedgersFrom(
 				perGPUBytes:     perGPU,
 				kvCapacityBytes: kvLimitUnknown,
 			}
+			alive := false
 			if model := snapshotModelForClaim(snapshots[instance.Pod], claim, served); model != nil {
 				engine.snapshotKey = snapshotActivityKey(*model)
 				engine.kvCapacityBytes = model.KVCapacityBytes
 				engine.inFlightRequests = max(model.RequestsRunning, 0) + max(model.RequestsWaiting, 0)
+				// A scrape that failed says nothing about load, and the engine may
+				// be too busy to answer it in time. A serving engine whose metrics
+				// could not be read is not taken for idle.
+				engine.demandUnknown = model.Ready && !model.RequestMetricsObserved
 				engine.asleep = model.Phase == runtimePhaseSleeping
+				alive = model.Alive
 				// A negative figure means there is no KV segment to read, and
 				// an engine without one has mapped nothing.
 				engine.kvUsedBytes = max(model.KVUsedBytes, 0)
@@ -286,8 +295,10 @@ func podLedgersFrom(
 			// put it back. An activating instance is charged, and deliberately:
 			// placement has already committed those bytes, and waiting for
 			// readiness would let a second claim be placed against the same
-			// memory.
-			if instance.Phase == modelv1alpha1.ModelClaimFailed && engine.snapshotKey == "" {
+			// memory. The runtime goes on listing an engine it has given up on,
+			// not alive, so a failed instance whose engine is listed but dead is
+			// gone as well.
+			if instance.Phase == modelv1alpha1.ModelClaimFailed && (engine.snapshotKey == "" || !alive) {
 				continue
 			}
 			// A claim whose declaration cannot be used is charged nothing, so its
