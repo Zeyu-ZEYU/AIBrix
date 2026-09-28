@@ -7,9 +7,12 @@ kvcached-enabled engine process; the gateway routes by served model name.
 See the [ModelClaim feature guide](../../docs/source/features/modelclaim.rst)
 for deployment, API, lifecycle, policy, and troubleshooting details.
 
-The runtime image must be layered on a kvcached-enabled vLLM image. The
-controller uses the runtime's snapshot endpoint to prefer an existing weight
-cache and lower live memory pressure when it chooses among warm pods.
+The runtime image must be layered on a kvcached-enabled vLLM image. Each claim
+declares `spec.perGPU`: what one instance costs on a GPU. The controller places
+a claim only on a pod whose card has room for it, by the size the runtime's
+snapshot endpoint reports and the costs the claims declare. Among such pods it
+prefers one that already has the weights. A claim without `perGPU` is not
+placed.
 Keep kvcached autopatch disabled for the runtime sidecar process itself; the
 launcher enables it only for the child engine process it starts.
 
@@ -40,8 +43,10 @@ engine port only after the runtime reports `active` and ready.
 not express GPU resources or parallelism. With kvcached enabled, do not add
 `--gpu-memory-utilization`; kvcached owns elastic KV allocation.
 
-An optional JSON policy on the warm-pool Deployment drives request-based KV
-limit redistribution and idle sleep. A request for a sleeping model triggers
+An optional JSON policy on the warm-pool Deployment drives idle sleep. Its
+request-based KV limit redistribution stands down on a pod where a claim holds
+its own KV limit, which every claim placed on a GPU does. A request for a
+sleeping model triggers
 an asynchronous wake and receives HTTP 503 with `Retry-After`; the gateway does
 not hold the original request.
 
