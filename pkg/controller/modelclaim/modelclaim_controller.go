@@ -245,7 +245,14 @@ func (r *ModelClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			// engine again. Divide it now, so its neighbours get back the room
 			// they gave up for it.
 			r.divideCards(ctx, candidates, readings)
-			return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, nil
+			// A start that failed is tried again as a refusal is, less and
+			// less often. A claim with an instance left comes back every
+			// round, to check that instance's engine.
+			wait := r.backoff().failedToStart(req.NamespacedName, pm.Generation)
+			if len(pm.Status.Instances) > 0 {
+				wait = DefaultRequeueDuration
+			}
+			return ctrl.Result{RequeueAfter: wait}, nil
 		}
 		// A claim with nothing placed has nothing else to do each round, so it
 		// comes back when its wait is up. One with an instance keeps coming
@@ -267,6 +274,11 @@ func (r *ModelClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// ready Activating instances, demote Active instances that went unhealthy).
 	r.reconcileInstanceHealth(ctx, pm, readings)
 	r.recomputeReadiness(pm)
+	if len(pm.Status.Instances) == 0 && r.backoff().waitsAfterAFailedStart(req.NamespacedName) {
+		// A pass inside the wait tried nothing, so the claim still stands as
+		// its last try left it.
+		pm.Status.Phase = modelv1alpha1.ModelClaimFailed
+	}
 	setClaimGauges(pm)
 	if err := r.Status().Update(ctx, pm); err != nil {
 		return requeueOnConflict(err)
