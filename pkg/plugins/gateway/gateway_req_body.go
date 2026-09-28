@@ -376,12 +376,13 @@ func modelClaimRetryResponse(model, state, reason string, retry bool) *extProcPb
 }
 
 // modelClaimReasonsNotRetried are the reasons the controller does not get past
-// by itself: the claim has to be changed first, or its engine failed for good.
-// Waiting does not help, so a client is not asked to retry. The controller
-// tries any other refusal again, including a failed activation.
+// by itself: the claim or its pool has to be changed first, or its engine
+// failed for good. Waiting does not help, so a client is not asked to retry.
+// The controller tries any other refusal again, including a failed activation.
 var modelClaimReasonsNotRetried = map[string]struct{}{
 	"InvalidEngineConfig": {},
 	"InvalidPerGPU":       {},
+	"TooLargeForAnyCard":  {},
 	"EngineFailed":        {},
 }
 
