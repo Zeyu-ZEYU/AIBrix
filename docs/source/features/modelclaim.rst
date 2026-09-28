@@ -681,9 +681,10 @@ claim's ``Scheduled`` condition while it waits, such as ``NoMatchingPods``, or
 from its ``Ready`` condition once it has failed. The controller tries such a
 claim again by itself, so the client is asked to retry as well. A claim that
 has to be changed first, such as one with ``InvalidEngineConfig`` or
-``InvalidPerGPU``, gets no ``Retry-After``. A terminally failed model, with
-``EngineFailed``, returns 503 without ``Retry-After`` as well. A model that no
-ModelClaim serves returns 400.
+``InvalidPerGPU``, gets no ``Retry-After``. Neither does one that no card in
+its pool can hold, with ``TooLargeForAnyCard``. A terminally failed model,
+with ``EngineFailed``, returns 503 without ``Retry-After`` as well. A model
+that no ModelClaim serves returns 400.
 
 The answer for a claim that is not placed comes from the ModelClaim object,
 not from a Pod, so it wakes nothing. If two claims serve one name, the first
