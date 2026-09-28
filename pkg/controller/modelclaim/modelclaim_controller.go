@@ -22,6 +22,7 @@ package modelclaim
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -422,6 +423,22 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 				UID:       string(pm.UID),
 			},
 		})
+		if errors.Is(aerr, errRuntimeSilent) {
+			// The call was not sent, so no activation failed. The claim waits
+			// for this runtime as it waits for a pod, and the next pass tries
+			// again. The refusal is raised as an Event only when it changes.
+			message := fmt.Sprintf("pod %s cannot be asked to start %s yet: %v",
+				pod.Name, servedModelName(pm), aerr)
+			if meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
+				Type:    string(modelv1alpha1.ModelClaimConditionTypeScheduled),
+				Status:  metav1.ConditionFalse,
+				Reason:  "NoMatchingPods",
+				Message: message,
+			}) {
+				r.Recorder.Event(pm, corev1.EventTypeWarning, "NoMatchingPods", message)
+			}
+			return nil
+		}
 		if aerr != nil {
 			recordActivation(pm.Namespace, servedModelName(pm), false)
 			return aerr
