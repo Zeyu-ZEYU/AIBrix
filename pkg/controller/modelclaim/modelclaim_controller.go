@@ -398,10 +398,39 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 	}
 	placementStates := r.collectPlacementStates(ctx, candidates, pm.Spec.ArtifactURL, parallelism)
 
+	// A pod whose runtime is left alone is skipped for the rest of this pass.
+	// Ranking cannot tell such a pod from the others, so without this the same
+	// pod could be picked on every pass while another one sits idle.
+	var silent []string
+	var silentErr error
 	for desiredReplicas(pm) > int32(len(pm.Status.Instances)) {
+		exclude := instancePods(pm)
+		for _, name := range silent {
+			exclude[name] = true
+		}
 		pod, selectErr := selectPodForActivationWithState(
-			candidates, instancePods(pm), load, servedModelName(pm), r.Locality, placementStates,
+			candidates, exclude, load, servedModelName(pm), r.Locality, placementStates,
 		)
+		if selectErr != nil && len(silent) > 0 {
+			// Every pod left has a runtime that is left alone. No call was
+			// sent, so no activation failed. The claim waits for these
+			// runtimes as it waits for a pod, and the next pass tries again.
+			// The refusal is raised as an Event only when it changes.
+			message := fmt.Sprintf("pod %s cannot be asked to start %s yet: %v",
+				silent[len(silent)-1], servedModelName(pm), silentErr)
+			if len(silent) > 1 {
+				message += fmt.Sprintf("; %d other pod(s) were skipped the same way", len(silent)-1)
+			}
+			if meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
+				Type:    string(modelv1alpha1.ModelClaimConditionTypeScheduled),
+				Status:  metav1.ConditionFalse,
+				Reason:  "NoMatchingPods",
+				Message: message,
+			}) {
+				r.Recorder.Event(pm, corev1.EventTypeWarning, "NoMatchingPods", message)
+			}
+			return nil
+		}
 		if selectErr != nil {
 			// No available warm pod right now; remain Pending and retry on requeue.
 			r.Recorder.Event(pm, corev1.EventTypeWarning, "NoMatchingPods", selectErr.Error())
@@ -416,20 +445,10 @@ func (r *ModelClaimReconciler) ensureActivated(ctx context.Context, pm *modelv1a
 
 		instance, aerr := r.activateOnPod(ctx, pm, pod)
 		if errors.Is(aerr, errRuntimeSilent) {
-			// The call was not sent, so no activation failed. The claim waits
-			// for this runtime as it waits for a pod, and the next pass tries
-			// again. The refusal is raised as an Event only when it changes.
-			message := fmt.Sprintf("pod %s cannot be asked to start %s yet: %v",
-				pod.Name, servedModelName(pm), aerr)
-			if meta.SetStatusCondition(&pm.Status.Conditions, metav1.Condition{
-				Type:    string(modelv1alpha1.ModelClaimConditionTypeScheduled),
-				Status:  metav1.ConditionFalse,
-				Reason:  "NoMatchingPods",
-				Message: message,
-			}) {
-				r.Recorder.Event(pm, corev1.EventTypeWarning, "NoMatchingPods", message)
-			}
-			return nil
+			// The call was not sent, so no activation failed. Try the next pod.
+			silent = append(silent, pod.Name)
+			silentErr = aerr
+			continue
 		}
 		if aerr != nil {
 			return aerr
