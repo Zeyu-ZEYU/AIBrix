@@ -999,6 +999,45 @@ func TestReconcileSnapshotTerminalFailureKeepsFailedPodsExcluded(t *testing.T) {
 	require.Len(t, runtime.deactivateCalls, 2)
 }
 
+func TestReconcileSnapshotTerminalFailureMovesPastASilentRuntime(t *testing.T) {
+	pm := withFinalizer(sampleModelClaim())
+	pm.UID = types.UID("claim-uid")
+	pm.Status.Phase = modelv1alpha1.ModelClaimActive
+	pm.Status.Instances = []modelv1alpha1.ModelClaimInstance{
+		{Pod: "warm-1", Port: 9001, Phase: modelv1alpha1.ModelClaimActive},
+	}
+	failedPod := warmPod("warm-1", "b300-pool-a", true, corev1.PodRunning)
+	silentPod := warmPod("warm-2", "b300-pool-a", true, corev1.PodRunning)
+	silentPod.Status.PodIP = testPeerIP
+	healthyPod := warmPod("warm-3", "b300-pool-a", true, corev1.PodRunning)
+	healthyPod.Status.PodIP = "10.0.0.3"
+	r, runtime := newReconciler(t, pm, failedPod, silentPod, healthyPod)
+	runtime.silentIPs = map[string]bool{silentPod.Status.PodIP: true}
+	runtime.snapshots = map[string]*RuntimeSnapshot{
+		failedPod.Status.PodIP: {Models: []RuntimeSnapshotModel{{
+			ModelName: servedModelName(pm), Port: 9001, Phase: runtimePhaseFailed,
+			Alive: false, Ready: false, LastError: "restart budget exhausted",
+			ClaimRef: &ModelClaimRef{Namespace: pm.Namespace, Name: pm.Name, UID: string(pm.UID)},
+		}}},
+		silentPod.Status.PodIP:  {},
+		healthyPod.Status.PodIP: {},
+	}
+
+	reconcileOnce(t, r, pm.Name)
+
+	// warm-2 ranks first by name, and its runtime is left alone, so the move
+	// goes on to warm-3. The failed engine is stopped once.
+	got := getModel(t, r, pm.Name)
+	require.Len(t, got.Status.Instances, 1)
+	assert.Equal(t, "warm-3", got.Status.Instances[0].Pod)
+	assert.Equal(t, modelv1alpha1.ModelClaimActivating, got.Status.Instances[0].Phase)
+	require.Len(t, runtime.activateCalls, 1)
+	require.Len(t, runtime.deactivateCalls, 1)
+	for _, event := range drainEvents(t, r) {
+		assert.NotContains(t, event, "RescheduleFailed")
+	}
+}
+
 func TestSnapshotModelForClaimPrefersMatchingClaimUID(t *testing.T) {
 	pm := sampleModelClaim()
 	pm.UID = types.UID("claim-uid")

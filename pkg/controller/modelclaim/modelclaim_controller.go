@@ -537,38 +537,51 @@ func (r *ModelClaimReconciler) rescheduleFailedInstances(
 			continue
 		}
 		failedPod := inst.Pod
-		pod, selectErr := selectPodForActivationWithState(
-			candidates, alreadyOn, load, servedModelName(pm), r.Locality, placementStates,
-		)
-		if selectErr != nil {
-			r.Recorder.Eventf(pm, corev1.EventTypeWarning, "ReschedulePending",
-				"model %s cannot move from failed pod %s: %v", servedModelName(pm), failedPod, selectErr)
-			return nil
-		}
-
-		// The engine is already terminal. Remove only this claim's old route and
-		// runtime entry; co-resident engines on the failed pod remain untouched.
-		r.deannotateWarmPod(ctx, pm.Namespace, failedPod, pm.Name)
-		if ip := r.podIP(ctx, pm.Namespace, failedPod); ip != "" {
-			if err := r.Runtime.Deactivate(ctx, ip, DefaultRuntimePort, &DeactivateRequest{
-				ModelName: servedModelName(pm),
-				Mode:      DeactivateStop,
-			}); err != nil {
-				klog.ErrorS(err, "failed engine cleanup before reschedule",
-					"pod", failedPod, "model", pm.Name)
+		cleaned := false
+		for {
+			pod, selectErr := selectPodForActivationWithState(
+				candidates, alreadyOn, load, servedModelName(pm), r.Locality, placementStates,
+			)
+			if selectErr != nil {
+				r.Recorder.Eventf(pm, corev1.EventTypeWarning, "ReschedulePending",
+					"model %s cannot move from failed pod %s: %v", servedModelName(pm), failedPod, selectErr)
+				return nil
 			}
-		}
 
-		replacement, activateErr := r.activateOnPod(ctx, pm, pod)
-		if activateErr != nil {
-			return fmt.Errorf("activate replacement on pod %s: %w", pod.Name, activateErr)
+			// The engine is already terminal. Remove only this claim's old route and
+			// runtime entry; co-resident engines on the failed pod remain untouched.
+			if !cleaned {
+				r.deannotateWarmPod(ctx, pm.Namespace, failedPod, pm.Name)
+				if ip := r.podIP(ctx, pm.Namespace, failedPod); ip != "" {
+					if err := r.Runtime.Deactivate(ctx, ip, DefaultRuntimePort, &DeactivateRequest{
+						ModelName: servedModelName(pm),
+						Mode:      DeactivateStop,
+					}); err != nil {
+						klog.ErrorS(err, "failed engine cleanup before reschedule",
+							"pod", failedPod, "model", pm.Name)
+					}
+				}
+				cleaned = true
+			}
+
+			replacement, activateErr := r.activateOnPod(ctx, pm, pod)
+			if errors.Is(activateErr, errRuntimeSilent) {
+				// The call was not sent. As placement does, leave this pod out
+				// for the rest of the pass and try the next one.
+				alreadyOn[pod.Name] = true
+				continue
+			}
+			if activateErr != nil {
+				return fmt.Errorf("activate replacement on pod %s: %w", pod.Name, activateErr)
+			}
+			*inst = replacement
+			alreadyOn[pod.Name] = true
+			load[pod.Name]++
+			r.Recorder.Eventf(pm, corev1.EventTypeNormal, "Rescheduled",
+				"model %s moved after terminal engine failure from pod %s to pod %s",
+				servedModelName(pm), failedPod, pod.Name)
+			break
 		}
-		*inst = replacement
-		alreadyOn[pod.Name] = true
-		load[pod.Name]++
-		r.Recorder.Eventf(pm, corev1.EventTypeNormal, "Rescheduled",
-			"model %s moved after terminal engine failure from pod %s to pod %s",
-			servedModelName(pm), failedPod, pod.Name)
 	}
 	return nil
 }
