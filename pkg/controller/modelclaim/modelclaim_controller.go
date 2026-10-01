@@ -588,6 +588,9 @@ func (r *ModelClaimReconciler) ensureActivated(
 	// claim's list, and its pod has to stay out for the next replacement too.
 	alreadyOn := instancePods(pm)
 	failed := failedInstanceSlots(pm)
+	// A failed engine is stopped once per pass, however many pods its
+	// replacement has to try.
+	stopped := map[string]bool{}
 	for desiredReplicas(pm) > int32(len(pm.Status.Instances)-len(failed)) {
 		pod, selectErr := selectPodForActivationWithState(
 			admissible, alreadyOn, load, servedModelName(pm), r.Locality, placementStates,
@@ -705,7 +708,10 @@ func (r *ModelClaimReconciler) ensureActivated(
 			slot = failed[0]
 			previous := pm.Status.Instances[slot]
 			replaced = &previous
-			r.stopFailedEngine(ctx, pm, previous.Pod, readings)
+			if !stopped[previous.Pod] {
+				r.stopFailedEngine(ctx, pm, previous.Pod, readings)
+				stopped[previous.Pod] = true
+			}
 			pm.Status.Instances[slot] = record
 		} else {
 			pm.Status.Instances = append(pm.Status.Instances, record)
@@ -716,6 +722,29 @@ func (r *ModelClaimReconciler) ensureActivated(
 
 		resp, aerr := r.Runtime.Activate(ctx, pod.Status.PodIP, DefaultRuntimePort, activateRequest(pm))
 		readings.forget(pod.Name)
+		if errors.Is(aerr, errRuntimeSilent) {
+			// The runtime is left alone for now, so the call was not sent and
+			// nothing failed to start. The record is taken back, as for any
+			// start known not to have happened, and this pod is passed over for
+			// the rest of the pass, as a card that could not be divided is.
+			// Ranking cannot tell such a pod from the others, so without this
+			// the same pod could be picked on every pass.
+			if replaced != nil {
+				pm.Status.Instances[slot] = *replaced
+			} else {
+				pm.Status.Instances = pm.Status.Instances[:slot]
+			}
+			refusals = append(refusals, podRefusal{
+				pod:       pod.Name,
+				roomBytes: ledgers[pod.Name].maximumRoomBytes(),
+				known:     true,
+				couldHold: true,
+				reason: fmt.Sprintf("%s cannot be asked to start %s yet: %v",
+					pod.Name, servedModelName(pm), aerr),
+			})
+			admissible = withoutPod(admissible, pod.Name)
+			continue
+		}
 		if aerr != nil {
 			recordActivation(pm.Namespace, servedModelName(pm), false)
 			// The record was written first to guard against a crash between
