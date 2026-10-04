@@ -410,7 +410,7 @@ func modelClaimRetryResponse(model, state, reason string, retry bool) *extProcPb
 var modelClaimReasonsNotRetried = map[string]struct{}{
 	"InvalidEngineConfig": {},
 	"InvalidPerGPU":       {},
-	"TooLargeForAnyCard":  {},
+	constants.ModelClaimReasonTooLargeForAnyCard: {},
 }
 
 // modelClaimRetryAfterByReason is how long a client is asked to wait, by the
