@@ -14,6 +14,8 @@ jobs:
       packages: write
       contents: read
     strategy:
+      # One failed image should not cancel the others.
+      fail-fast: false
       matrix:
         component:
           - name: controller-manager
@@ -29,7 +31,18 @@ jobs:
           - name: vllm-mock
             file: development/app/Dockerfile
             context: development/app
+          - name: kvcached-runtime
+            file: build/container/Dockerfile.kvcached-runtime
+            # Its kvcached-vLLM base image is built for amd64 only.
+            platforms: linux/amd64
     steps:
+      # The kvcached-runtime build needs about 31 GB of disk, more than the
+      # 14 GB that GitHub documents for its hosted runners.
+      - name: Free Disk Space
+        if: matrix.component.name == 'kvcached-runtime'
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
       - uses: actions/checkout@v6
         with:
           submodules: 'true'
@@ -45,7 +58,7 @@ jobs:
       - name: Build and push ${{ matrix.component.name }}
         uses: docker/build-push-action@v7
         with:
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.component.platforms || 'linux/amd64,linux/arm64' }}
           context: ${{ matrix.component.context || '.' }}
           file: ${{ matrix.component.file }}
           push: true
@@ -59,6 +72,8 @@ jobs:
       packages: write
       contents: read
     strategy:
+      # One failed image should not cancel the others.
+      fail-fast: false
       matrix:
         component:
           - name: controller-manager
@@ -74,7 +89,18 @@ jobs:
           - name: vllm-mock
             file: development/app/Dockerfile
             context: development/app
+          - name: kvcached-runtime
+            file: build/container/Dockerfile.kvcached-runtime
+            # Its kvcached-vLLM base image is built for amd64 only.
+            platforms: linux/amd64
     steps:
+      # The kvcached-runtime build needs about 31 GB of disk, more than the
+      # 14 GB that GitHub documents for its hosted runners.
+      - name: Free Disk Space
+        if: matrix.component.name == 'kvcached-runtime'
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
       - uses: actions/checkout@v6
         with:
           submodules: 'true'
@@ -91,7 +117,7 @@ jobs:
       - name: Build and push ${{ matrix.component.name }}
         uses: docker/build-push-action@v7
         with:
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.component.platforms || 'linux/amd64,linux/arm64' }}
           context: ${{ matrix.component.context || '.' }}
           file: ${{ matrix.component.file }}
           push: true
